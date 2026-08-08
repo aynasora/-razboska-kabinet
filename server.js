@@ -88,7 +88,9 @@ const HTML_PAGE = `<!DOCTYPE html>
   .stamp-banner{display:flex;align-items:center;gap:12px;border:1px solid var(--brass);background:var(--brass-soft);border-radius:var(--radius);padding:12px 16px;margin-bottom:24px;}
   .stamp{border:1.5px solid var(--brass);color:var(--brass);font-family:'Fraunces',serif;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:3px 9px;border-radius:20px;transform:rotate(-2deg);flex-shrink:0;}
   .stamp-banner p{margin:0;font-size:13px;color:#5c4826;}
-  .table-card{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:#fff;}
+  .table-card{border:1px solid var(--line);border-radius:var(--radius);overflow-x:auto;background:#fff;}
+  .table-card table{min-width:920px;}
+  .purpose-cell{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);cursor:help;}
   table{width:100%;border-collapse:collapse;}
   th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:0.04em;color:var(--muted);font-weight:500;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--paper-2);}
   td{padding:13px 16px;border-bottom:1px solid var(--line-soft);font-size:13.5px;vertical-align:middle;}
@@ -145,6 +147,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       <div class="topbar">
         <div><div class="eyebrow">Банковская выписка</div><h1>Проверка операций</h1></div>
         <div>
+          <button class="btn btn-ghost" onclick="clearOperations()">Очистить список</button>
           <button class="btn btn-primary" onclick="document.getElementById('upload-input').click()">+ Загрузить выписку</button>
           <input type="file" id="upload-input" accept=".xlsx,.xls" style="display:none" onchange="doUpload(this.files[0])">
         </div>
@@ -154,9 +157,10 @@ const HTML_PAGE = `<!DOCTYPE html>
           <div class="stamp">Черновик</div>
           <p>Подтверждение создаёт документ в 1С без проведения. Проводите сами после проверки.</p>
         </div>
+        <div id="review-summary" style="font-size:12.5px;color:var(--muted);margin-bottom:12px;"></div>
         <div class="table-card"><table>
-          <thead><tr><th>Дата</th><th>Контрагент</th><th>БИН/ИИН</th><th>Назначение</th><th>Сумма</th><th>Категория</th><th>Статус</th><th></th></tr></thead>
-          <tbody id="review-tbody"><tr><td colspan="8" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
+          <thead><tr><th>Дата</th><th>Контрагент</th><th>БИН/ИИН</th><th>Назначение</th><th>КНП</th><th>Сумма</th><th>Статья ДДС</th><th>Счёт</th><th>Договор</th><th>Статус</th><th></th></tr></thead>
+          <tbody id="review-tbody"><tr><td colspan="11" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
         </table></div>
       </div>
     </div>
@@ -174,7 +178,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     <div class="view hidden" id="view-rules">
       <div class="topbar"><div><div class="eyebrow">Категоризация</div><h1>Правила</h1></div></div>
       <div class="view-body" style="padding:28px 32px 0;max-width:720px;">
-        <p style="font-size:12.5px;color:var(--muted);margin:-6px 0 18px;">Правило вида: если в назначении платежа (или в имени контрагента) есть такой-то текст — предложить такую-то категорию. Правила применяются сразу, без перезагрузки выписки.</p>
+        <p style="font-size:12.5px;color:var(--muted);margin:-6px 0 18px;">Правило вида: если в назначении платежа (или в имени контрагента) есть такой-то текст — предложить статью ДДС и/или счёт. Статья ДДС обязательна для подтверждения операции. Правила применяются сразу, без перезагрузки выписки.</p>
         <div class="settings-card" style="max-width:none;">
           <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
             <div style="flex:1;min-width:140px;">
@@ -184,21 +188,36 @@ const HTML_PAGE = `<!DOCTYPE html>
                 <option value="counterparty">Имя контрагента</option>
               </select>
             </div>
-            <div style="flex:2;min-width:180px;">
+            <div style="flex:2;min-width:160px;">
               <label>Содержит текст</label>
               <input id="r-contains" placeholder="например: аренда">
             </div>
-            <div style="flex:2;min-width:180px;">
-              <label>Категория</label>
+            <div style="flex:2;min-width:160px;">
+              <label>Статья ДДС</label>
               <input id="r-category" placeholder="например: Аренда офиса">
+            </div>
+            <div style="flex:1;min-width:110px;">
+              <label>Счёт</label>
+              <input id="r-account" placeholder="например: 3360">
             </div>
             <button class="btn btn-primary" style="margin-bottom:12px;" onclick="addRule()">Добавить</button>
           </div>
           <span id="rules-msg" style="font-size:12.5px;color:var(--muted);"></span>
         </div>
+
+        <div class="settings-card" style="max-width:none;">
+          <div class="settings-title" style="margin-bottom:6px;">Массовая загрузка правил текстом</div>
+          <p style="font-size:12px;color:var(--muted);margin:0 0 10px;">Одна строка — одно правило, поля через вертикальную черту «|»: <b>текст-условие | статья ДДС | счёт</b>. Например:<br><span class="mono" style="font-size:12px;">аренда | Аренда офиса | 3360</span></p>
+          <textarea id="r-bulk" rows="5" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:'IBM Plex Mono',monospace;" placeholder="аренда | Аренда офиса | 3360&#10;подписка | Подписки и лицензии | 3360&#10;реклама | Реклама и маркетинг | 7210"></textarea>
+          <div style="margin-top:10px;">
+            <button class="btn btn-primary" onclick="importRules()">Загрузить правила</button>
+            <span id="rules-import-msg" style="font-size:12.5px;color:var(--muted);margin-left:10px;"></span>
+          </div>
+        </div>
+
         <div class="table-card"><table>
-          <thead><tr><th>Поле</th><th>Содержит</th><th>Категория</th><th></th></tr></thead>
-          <tbody id="rules-tbody"><tr><td colspan="4" class="empty">Правил пока нет</td></tr></tbody>
+          <thead><tr><th>Поле</th><th>Содержит</th><th>Статья ДДС</th><th>Счёт</th><th></th></tr></thead>
+          <tbody id="rules-tbody"><tr><td colspan="5" class="empty">Правил пока нет</td></tr></tbody>
         </table></div>
       </div>
     </div>
@@ -345,31 +364,59 @@ async function loadOperations(){
   const ops = await api('/api/operations');
   const tbody = document.getElementById('review-tbody');
   tbody.innerHTML = '';
-  const pending = ops.filter(o=>o.status!=='draft_created');
+  const pending = ops.filter(o=>o.status==='review' || o.status==='new_counterparty');
   document.getElementById('review-count').textContent = pending.length;
-  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="8" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
+
+  const summary = document.getElementById('review-summary');
+  if(summary){
+    const already = ops.filter(o=>o.status==='already_in_1c').length;
+    const done = ops.filter(o=>o.status==='draft_created').length;
+    summary.textContent = ops.length
+      ? \`Всего в выписке: \${ops.length} · Уже в 1С: \${already} · Черновиков создано: \${done} · К проверке: \${pending.length}\`
+      : '';
+  }
+
+  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="11" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
   ops.forEach(o=>{
     const tr = document.createElement('tr');
     const done = o.status==='draft_created';
     const isNew = o.status==='new_counterparty';
+    const already = o.status==='already_in_1c';
+    const hasCategory = !!o.suggestedCategory;
+    const contractAmbiguous = o.contractStatus === 'ambiguous';
     let statusHtml, actionHtml;
     if(done){
       statusHtml = '<span class="pill pill-approved">Черновик создан</span>';
       actionHtml = '';
+    } else if(already){
+      statusHtml = '<span class="pill pill-review" style="background:var(--paper-2);color:var(--muted);">Уже в 1С</span>';
+      actionHtml = '';
     } else if(isNew){
       statusHtml = '<span class="pill pill-new">Новый контрагент</span>';
       actionHtml = '<button class="icon-btn" onclick="createCounterparty(\\''+o.id+'\\')">Создать контрагента</button>';
+    } else if(!hasCategory){
+      statusHtml = '<span class="pill pill-new">Нет статьи ДДС</span>';
+      actionHtml = '<button class="icon-btn" disabled title="Сначала определите статью ДДС в разделе «Правила»" style="opacity:0.5;cursor:not-allowed;">Подтвердить</button>';
+    } else if(contractAmbiguous){
+      statusHtml = '<span class="pill pill-new">Неясен договор</span>';
+      actionHtml = '<button class="icon-btn" disabled title="У контрагента несколько договоров — нужен ручной выбор" style="opacity:0.5;cursor:not-allowed;">Подтвердить</button>';
     } else {
       statusHtml = '<span class="pill pill-review">На проверке</span>';
       actionHtml = '<button class="icon-btn confirm" onclick="confirmOp(\\''+o.id+'\\')">Подтвердить</button>';
     }
+    const contractCell = contractAmbiguous
+      ? '<span style="color:var(--red)">несколько — выбрать</span>'
+      : (o.contractName || '—');
     tr.innerHTML = \`
       <td class="mono" style="color:var(--muted)">\${o.date}</td>
       <td>\${o.counterparty || '—'}</td>
       <td class="mono" style="color:var(--muted)">\${o.bin || '—'}</td>
-      <td style="max-width:220px;color:var(--muted)">\${o.purpose}</td>
+      <td class="purpose-cell" title="\${o.purpose.replace(/"/g,'&quot;')}">\${o.purpose}</td>
+      <td class="mono" style="color:var(--muted)">\${o.knp || '—'}</td>
       <td class="mono \${o.amount>0?'amt-in':'amt-out'}">\${money(o.amount)}</td>
-      <td style="color:var(--muted)">\${o.suggestedCategory || '—'}</td>
+      <td style="color:\${hasCategory?'var(--ink)':'var(--red)'}">\${o.suggestedCategory || 'не определена'}</td>
+      <td class="mono" style="color:var(--muted)">\${o.suggestedAccount || '—'}</td>
+      <td style="font-size:12.5px;">\${contractCell}</td>
       <td>\${statusHtml}</td>
       <td>\${actionHtml}</td>
     \`;
@@ -395,14 +442,15 @@ async function loadRules(){
   const rules = await api('/api/rules');
   const tbody = document.getElementById('rules-tbody');
   tbody.innerHTML = '';
-  if(rules.length===0){ tbody.innerHTML = '<tr><td colspan="4" class="empty">Правил пока нет</td></tr>'; return; }
+  if(rules.length===0){ tbody.innerHTML = '<tr><td colspan="5" class="empty">Правил пока нет</td></tr>'; return; }
   rules.forEach(r=>{
     const tr = document.createElement('tr');
     const fieldLabel = r.field==='counterparty' ? 'Имя контрагента' : 'Назначение платежа';
     tr.innerHTML = \`
       <td>\${fieldLabel}</td>
       <td>\${r.contains}</td>
-      <td>\${r.category}</td>
+      <td>\${r.category || '—'}</td>
+      <td class="mono">\${r.account || '—'}</td>
       <td><button class="icon-btn" onclick="deleteRule('\${r.id}')">Удалить</button></td>
     \`;
     tbody.appendChild(tr);
@@ -413,12 +461,25 @@ async function addRule(){
   const field = document.getElementById('r-field').value;
   const contains = document.getElementById('r-contains').value.trim();
   const category = document.getElementById('r-category').value.trim();
+  const account = document.getElementById('r-account').value.trim();
   const msg = document.getElementById('rules-msg');
   try{
-    await api('/api/rules', {method:'POST', body: JSON.stringify({field, contains, category})});
+    await api('/api/rules', {method:'POST', body: JSON.stringify({field, contains, category, account})});
     document.getElementById('r-contains').value = '';
     document.getElementById('r-category').value = '';
+    document.getElementById('r-account').value = '';
     msg.textContent = 'Правило добавлено';
+    loadRules(); loadOperations();
+  }catch(e){ msg.textContent = e.message; }
+}
+
+async function importRules(){
+  const text = document.getElementById('r-bulk').value;
+  const msg = document.getElementById('rules-import-msg');
+  try{
+    const result = await api('/api/rules/import', {method:'POST', body: JSON.stringify({text})});
+    msg.textContent = \`Добавлено: \${result.added}\` + (result.skipped ? \`, пропущено: \${result.skipped}\` : '');
+    document.getElementById('r-bulk').value = '';
     loadRules(); loadOperations();
   }catch(e){ msg.textContent = e.message; }
 }
@@ -434,6 +495,12 @@ async function doUpload(file){
   fd.append('file', file);
   const res = await fetch('/api/upload', {method:'POST', credentials:'include', body: fd});
   if(!res.ok){ const e = await res.json().catch(()=>({})); alert(e.error||'Ошибка загрузки'); return; }
+  loadOperations(); loadHistory();
+}
+
+async function clearOperations(){
+  if(!confirm('Очистить весь список операций в кабинете? Это не затронет данные в 1С — только список здесь, в кабинете.')) return;
+  await api('/api/operations/clear', {method:'POST'});
   loadOperations(); loadHistory();
 }
 
@@ -488,15 +555,15 @@ if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) writeJson('rules.json', [
 
 // Применяет ваши правила категоризации к операции: смотрит назначение
 // платежа и/или имя контрагента, и если находит совпадение — возвращает
-// название категории. Правила проверяются по порядку, первое совпадение побеждает.
+// категорию и счёт. Правила проверяются по порядку, первое совпадение побеждает.
 function applyRules(op, rules) {
   for (const rule of rules) {
     const haystack = (rule.field === 'counterparty' ? op.counterparty : op.purpose) || '';
     if (haystack.toLowerCase().includes(String(rule.contains || '').toLowerCase())) {
-      return rule.category;
+      return { category: rule.category || '', account: rule.account || '' };
     }
   }
-  return '';
+  return { category: '', account: '' };
 }
 
 // ---------- вход по паролю (сессия в памяти сервера) ----------
@@ -570,13 +637,25 @@ app.post('/api/settings/browse', requireAuth, async (req, res) => {
   const base = baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${login}:${pass}`).toString('base64');
 
+  const attempts = []; // для диагностики — что именно пробовали и что ответила 1С
+
   async function tryFetchList(catalogName) {
-    const response = await fetch(`${base}/${catalogName}?$format=json&$select=Ref_Key,Description&$top=100`, {
-      headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
-    });
-    if (!response.ok) return null; // пробуем следующий вариант названия
+    let response;
+    try {
+      response = await fetch(`${base}/${catalogName}?$format=json&$select=Ref_Key,Description&$top=100`, {
+        headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+      });
+    } catch (e) {
+      attempts.push(`${catalogName}: не удалось подключиться (${e.message})`);
+      return null;
+    }
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      attempts.push(`${catalogName}: код ${response.status} — ${text.slice(0, 150)}`);
+      return null;
+    }
     const data = await response.json().catch(() => null);
-    if (!data) return null;
+    if (!data) { attempts.push(`${catalogName}: ответ не в формате JSON`); return null; }
     return (data.value || []).map(x => ({ key: x.Ref_Key, name: x.Description }));
   }
 
@@ -593,7 +672,7 @@ app.post('/api/settings/browse', requireAuth, async (req, res) => {
   try {
     const orgMatch = await fetchFirstMatch(['Catalog_Организации']);
     if (!orgMatch) {
-      return res.status(502).json({ error: 'Не удалось найти справочник организаций (Catalog_Организации). Проверьте логин/пароль/адрес.' });
+      return res.status(502).json({ error: 'Не удалось получить справочник организаций. Подробности: ' + attempts.join(' | ') });
     }
     const accMatch = await fetchFirstMatch([
       'Catalog_БанковскиеСчета',
@@ -603,7 +682,7 @@ app.post('/api/settings/browse', requireAuth, async (req, res) => {
       'Catalog_СчетаОрганизаций',
     ]);
     if (!accMatch) {
-      return res.status(502).json({ error: 'Организации нашлись, но не удалось найти справочник расчётных счетов ни под одним из известных названий. Уточните у вашего 1С-специалиста точное имя справочника счетов, и я добавлю его в список.' });
+      return res.status(502).json({ error: 'Организации нашлись, но не удалось найти справочник расчётных счетов. Подробности: ' + attempts.join(' | ') });
     }
     res.json({ organizations: orgMatch.result, accounts: accMatch.result, accountCatalogUsed: accMatch.name });
   } catch (e) {
@@ -654,6 +733,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
         senderBin: findCol(c => (c.includes('бин') || c.includes('иин')) && c.includes('отправ')),
         receiverBin: findCol(c => (c.includes('бин') || c.includes('иин')) && c.includes('получ')),
         binGeneric: findCol(c => c.includes('бин') || c.includes('иин')),
+        knp: findCol(c => c.includes('кнп') || c.includes('тмк')),
       };
       break;
     }
@@ -687,6 +767,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
         counterparty: cols.counterparty !== -1 ? String(row[cols.counterparty] || '') : '',
         bin: String(bin || ''),
         purpose: cols.purpose !== -1 ? String(row[cols.purpose] || '') : '',
+        knp: cols.knp !== -1 ? String(row[cols.knp] || '') : '', // код назначения платежа — берём прямо из выписки банка
         amount,
         suggestedCategory: '',
         status: 'review',
@@ -727,24 +808,76 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
   }
 
   const all = readJson('operations.json', []);
-  const updated = [...all, ...operations];
-  writeJson('operations.json', updated);
-  addHistory(`Загружена выписка ${req.file.originalname} · ${operations.length} операций`, '—');
 
-  // Сразу пытаемся сопоставить контрагентов по БИН/ИИН со справочником 1С —
-  // если подключение уже настроено. Если контрагент не найден, операция
-  // помечается статусом new_counterparty и требует отдельного подтверждения
-  // на создание нового контрагента (см. /api/operations/:id/create-counterparty).
+  // Не добавляем операцию повторно, если такая же (по дате, сумме, БИН и
+  // назначению) уже есть в списке — иначе повторная загрузка того же файла
+  // задваивает список.
+  const dedupKey = (o) => `${o.date}|${o.amount}|${o.bin}|${o.purpose}`;
+  const existingKeys = new Set(all.map(dedupKey));
+  const newOnly = operations.filter(op => !existingKeys.has(dedupKey(op)));
+  const skippedDuplicates = operations.length - newOnly.length;
+
+  const updated = [...all, ...newOnly];
+  writeJson('operations.json', updated);
+  addHistory(
+    `Загружена выписка ${req.file.originalname} · ${newOnly.length} новых операций` +
+      (skippedDuplicates ? ` · ${skippedDuplicates} пропущено как дубли` : ''),
+    '—'
+  );
+
+  // Сразу пытаемся сопоставить контрагентов по БИН/ИИН со справочником 1С,
+  // и проверить — нет ли такой операции уже среди документов в самой 1С
+  // (чтобы не предлагать создавать то, что уже разнесено вручную или
+  // другим способом). Всё это — только если подключение уже настроено.
   const settingsForMatch = readJson('settings.json', {});
   if (settingsForMatch.baseUrl && settingsForMatch.login) {
-    for (const op of operations) {
+    for (const op of newOnly) {
+      const target = updated.find(o => o.id === op.id);
+
+      try {
+        const alreadyExists = await checkExistingInOnec(op, settingsForMatch);
+        if (alreadyExists) {
+          target.status = 'already_in_1c';
+          continue; // не тратим время на сопоставление контрагента — операция и так пропускается
+        }
+      } catch (e) {
+        // Если сверка не удалась — не блокируем, просто идём дальше как обычно.
+      }
+
       if (!op.bin) continue;
       try {
         const found = await findCounterpartyByBin(op.bin, settingsForMatch);
-        const target = updated.find(o => o.id === op.id);
         if (found) {
           target.counterpartyKey = found.Ref_Key;
           target.counterpartyMatchedName = found.Description || '';
+
+          // Смотрим, как этот контрагент категоризировался раньше в 1С —
+          // если найдём паттерн, используем ту же статью ДДС автоматически.
+          try {
+            const historical = await findHistoricalCategory(found.Ref_Key, op.amount, settingsForMatch);
+            if (historical) {
+              target.historicalCategory = historical.categoryName || '';
+              target.historicalCategoryKey = historical.categoryKey || '';
+              target.historicalOperationKind = historical.operationKind || '';
+            }
+          } catch (e) {
+            // Не критично — просто не будет автопредложения по истории для этой операции.
+          }
+
+          // Ищем договор контрагента — если он есть в справочнике и найден
+          // однозначно, привяжем его к документу автоматически.
+          try {
+            const contract = await findContractForCounterparty(found.Ref_Key, op.purpose, settingsForMatch);
+            target.contractStatus = contract.status;
+            if (contract.status === 'matched') {
+              target.contractKey = contract.key;
+              target.contractName = contract.name;
+            } else if (contract.status === 'ambiguous') {
+              target.contractOptions = contract.options;
+            }
+          } catch (e) {
+            // Не критично — просто без привязки к договору.
+          }
         } else {
           target.status = 'new_counterparty';
         }
@@ -756,17 +889,28 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
     writeJson('operations.json', updated);
   }
 
-  res.json({ operations });
+  res.json({ operations: newOnly, skippedDuplicates });
 });
 
 // ---------- список операций на проверку ----------
 app.get('/api/operations', requireAuth, (req, res) => {
   const ops = readJson('operations.json', []);
   const rules = readJson('rules.json', []);
-  // Категория считается "на лету" по текущим правилам — если вы добавите
-  // или измените правило, категории в уже загруженных операциях
-  // пересчитаются сразу же, без повторной загрузки файла.
-  const withCategories = ops.map(op => ({ ...op, suggestedCategory: applyRules(op, rules) }));
+  // Категория/счёт считаются "на лету" по текущим правилам — если вы
+  // добавите или измените правило, категории в уже загруженных операциях
+  // пересчитаются сразу же, без повторной загрузки файла. Историческая
+  // категория из 1С (по прошлым документам контрагента) — приоритетнее.
+  const withCategories = ops.map(op => {
+    const ruleMatch = applyRules(op, rules);
+    const category = op.historicalCategory || ruleMatch.category;
+    const account = op.historicalAccount || ruleMatch.account;
+    return {
+      ...op,
+      suggestedCategory: category,
+      suggestedAccount: account,
+      needsAttention: !category, // ДДС обязательна — если не определена, операцию нельзя тихо подтверждать
+    };
+  });
   res.json(withCategories);
 });
 
@@ -781,12 +925,22 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
   }
 
+  // Статья ДДС обязательна — без неё документ не создаём, даже если
+  // контрагент найден. Либо она должна прийти из истории 1С, либо из
+  // ваших правил категоризации.
+  const rules = readJson('rules.json', []);
+  const ruleMatch = applyRules(op, rules);
+  const category = op.historicalCategory || ruleMatch.category;
+  if (!category) {
+    return res.status(400).json({ error: 'Не определена статья ДДС — добавьте правило категоризации (раздел «Правила») или дождитесь исторического сопоставления, прежде чем подтверждать.' });
+  }
+
   try {
     const result = await createDraftInOnec(op, settings);
     op.status = 'draft_created';
     op.onecDocNumber = result.docNumber || null;
     writeJson('operations.json', all);
-    addHistory(`Создан черновик в 1С: ${op.counterparty || 'операция'} · ${op.amount} ₸`, result.docNumber || '—');
+    addHistory(`Создан черновик в 1С: ${op.counterparty || 'операция'} · ${op.amount} ₸ · статья: ${category}`, result.docNumber || '—');
     res.json({ ok: true, op });
   } catch (e) {
     addHistory(`Ошибка при создании черновика: ${e.message}`, '—');
@@ -838,20 +992,52 @@ app.get('/api/rules', requireAuth, (req, res) => {
 });
 
 app.post('/api/rules', requireAuth, (req, res) => {
-  const { field, contains, category } = req.body;
-  if (!contains || !category) {
-    return res.status(400).json({ error: 'Заполните и условие, и категорию' });
+  const { field, contains, category, account } = req.body;
+  if (!contains || (!category && !account)) {
+    return res.status(400).json({ error: 'Укажите условие и хотя бы одно из: категорию или счёт' });
   }
   const rules = readJson('rules.json', []);
   rules.push({
     id: crypto.randomUUID(),
     field: field === 'counterparty' ? 'counterparty' : 'purpose',
     contains: String(contains),
-    category: String(category),
+    category: String(category || ''),
+    account: String(account || ''),
   });
   writeJson('rules.json', rules);
-  addHistory(`Добавлено правило: "${contains}" → ${category}`, '—');
+  addHistory(`Добавлено правило: "${contains}" → ${category || ''} ${account ? '(счёт ' + account + ')' : ''}`, '—');
   res.json(rules);
+});
+
+// Массовый импорт правил текстом — по одному правилу на строку, поля через
+// вертикальную черту: текст-условие | категория (статья ДДС) | счёт | (поле: purpose/counterparty, необязательно)
+// Пример строки: аренда | Аренда офиса | 3360
+app.post('/api/rules/import', requireAuth, (req, res) => {
+  const { text } = req.body;
+  if (!text || !text.trim()) {
+    return res.status(400).json({ error: 'Вставьте текст с правилами' });
+  }
+  const rules = readJson('rules.json', []);
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  let added = 0;
+  let skipped = 0;
+  for (const line of lines) {
+    const parts = line.split('|').map(p => p.trim());
+    if (parts.length < 2 || !parts[0]) { skipped++; continue; }
+    const [contains, category, account, fieldRaw] = parts;
+    if (!category && !account) { skipped++; continue; }
+    rules.push({
+      id: crypto.randomUUID(),
+      field: fieldRaw === 'counterparty' ? 'counterparty' : 'purpose',
+      contains,
+      category: category || '',
+      account: account || '',
+    });
+    added++;
+  }
+  writeJson('rules.json', rules);
+  addHistory(`Импортировано правил: ${added}${skipped ? `, пропущено строк: ${skipped}` : ''}`, '—');
+  res.json({ rules, added, skipped });
 });
 
 app.delete('/api/rules/:id', requireAuth, (req, res) => {
@@ -860,6 +1046,13 @@ app.delete('/api/rules/:id', requireAuth, (req, res) => {
   writeJson('rules.json', filtered);
   addHistory('Удалено правило категоризации', '—');
   res.json(filtered);
+});
+
+// ---------- очистить список операций (начать заново) ----------
+app.post('/api/operations/clear', requireAuth, (req, res) => {
+  writeJson('operations.json', []);
+  addHistory('Список операций очищен вручную', '—');
+  res.json({ ok: true });
 });
 
 app.get('/api/history', requireAuth, (req, res) => {
@@ -873,6 +1066,111 @@ function addHistory(action, doc) {
 
 // Ищет контрагента в справочнике 1С по БИН/ИИН через OData.
 // Возвращает объект контрагента (с Ref_Key) или null, если не найден.
+// Проверяет, нет ли уже среди документов 1С (Платёжное поручение
+// входящее/исходящее) операции с такой же датой и суммой — чтобы не
+// предлагать создавать то, что уже разнесено (вручную или иначе).
+async function checkExistingInOnec(op, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const docType = op.amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
+  const amount = Math.abs(op.amount);
+  // Дата у нас хранится как ДД.ММ.ГГГГ — переводим в ГГГГ-ММ-ДД для фильтра OData
+  const parts = String(op.date).split('.');
+  if (parts.length !== 3) return false;
+  const isoDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
+  const filter = encodeURIComponent(
+    `Date ge datetime'${isoDate}T00:00:00' and Date le datetime'${isoDate}T23:59:59' and СуммаДокумента eq ${amount}`
+  );
+  const url = `${base}/${docType}?$format=json&$filter=${filter}&$select=Ref_Key`;
+
+  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+  if (!response.ok) return false; // если сверить не удалось — не блокируем, просто считаем, что не нашли
+  const data = await response.json().catch(() => null);
+  if (!data) return false;
+  return (data.value || []).length > 0;
+}
+
+// Смотрит в 1С, какие документы уже создавались для этого контрагента
+// раньше, и берёт статью ДДС из самого свежего такого документа — чтобы
+// новая операция была категоризирована так же, как вы (или REST-сервис)
+// категоризировали её раньше для этого же контрагента.
+// Пытается найти номер договора прямо в тексте назначения платежа —
+// банки/бухгалтеры обычно пишут "по дог. №...", "договор №...", "дог. N..."
+function extractContractNumber(purpose) {
+  if (!purpose) return null;
+  const match = purpose.match(/до?г(?:овор)?\.?\s*(?:№|N|no\.?)?\s*([\w\-\/]{2,})/i);
+  return match ? match[1] : null;
+}
+
+// Ищет договор(ы) контрагента в 1С. Если найден ровно один — используем
+// его автоматически. Если несколько — не гадаем, а помечаем операцию как
+// требующую ручного выбора договора. Если в тексте назначения нашёлся
+// номер договора — в первую очередь пытаемся сопоставить именно по нему.
+async function findContractForCounterparty(counterpartyKey, purposeText, settings) {
+  if (!counterpartyKey) return { status: 'none' };
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const candidates = ['Catalog_ДоговорыКонтрагентов', 'Catalog_Договоры'];
+
+  for (const catalog of candidates) {
+    const filter = encodeURIComponent(`Владелец_Key eq guid'${counterpartyKey}' or Контрагент_Key eq guid'${counterpartyKey}'`);
+    const url = `${base}/${catalog}?$format=json&$filter=${filter}&$select=Ref_Key,Description,Number&$top=20`;
+    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!response.ok) continue; // пробуем следующее возможное название справочника
+    const data = await response.json().catch(() => null);
+    const list = (data && data.value) || [];
+    if (list.length === 0) continue;
+
+    if (list.length === 1) {
+      return { status: 'matched', key: list[0].Ref_Key, name: list[0].Description || list[0].Number };
+    }
+
+    // Несколько договоров — пробуем сопоставить по номеру, найденному в назначении платежа
+    const hint = extractContractNumber(purposeText);
+    if (hint) {
+      const byNumber = list.find(d =>
+        (d.Number && d.Number.includes(hint)) || (d.Description && d.Description.includes(hint))
+      );
+      if (byNumber) {
+        return { status: 'matched', key: byNumber.Ref_Key, name: byNumber.Description || byNumber.Number };
+      }
+    }
+    return { status: 'ambiguous', options: list.map(d => ({ key: d.Ref_Key, name: d.Description || d.Number })) };
+  }
+  return { status: 'none' }; // у конфигурации либо нет отдельного справочника договоров, либо название другое
+}
+
+async function findHistoricalCategory(counterpartyKey, amount, settings) {
+  if (!counterpartyKey) return null;
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const docType = amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
+
+  const filter = encodeURIComponent(`Контрагент_Key eq guid'${counterpartyKey}'`);
+  const url = `${base}/${docType}?$format=json&$filter=${filter}&$orderby=Date desc&$top=1&$select=СтатьяДвиженияДенежныхСредств_Key,ВидОперации`;
+
+  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+  if (!response.ok) return null;
+  const data = await response.json().catch(() => null);
+  const doc = data && data.value && data.value[0];
+  if (!doc || !doc.СтатьяДвиженияДенежныхСредств_Key) return null;
+
+  // Статья хранится как GUID — подтягиваем её человекочитаемое название
+  const categoryKey = doc.СтатьяДвиженияДенежныхСредств_Key;
+  const categoryCatalogs = ['Catalog_СтатьиДвиженияДенежныхСредств', 'Catalog_СтатьиДДС'];
+  for (const catalog of categoryCatalogs) {
+    const catUrl = `${base}/${catalog}(guid'${categoryKey}')?$format=json&$select=Description`;
+    const catResp = await fetch(catUrl, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (catResp.ok) {
+      const catData = await catResp.json().catch(() => null);
+      if (catData && catData.Description) {
+        return { categoryKey, categoryName: catData.Description, operationKind: doc.ВидОперации || '' };
+      }
+    }
+  }
+  return { categoryKey, categoryName: '', operationKind: doc.ВидОперации || '' };
+}
+
 async function findCounterpartyByBin(bin, settings) {
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
@@ -949,6 +1247,26 @@ async function createDraftInOnec(op, settings) {
     НазначениеПлатежа: op.purpose,
     Комментарий: 'Черновик создан автоматически · личный кабинет разноски выписок',
   };
+
+  // Если для этого контрагента нашлась статья ДДС / вид операции по прошлым
+  // документам — используем их, чтобы категоризация совпадала с тем, как
+  // вы (или прежний REST-сервис) разносили такие операции раньше.
+  if (op.historicalCategoryKey) {
+    payload.СтатьяДвиженияДенежныхСредств_Key = op.historicalCategoryKey;
+  }
+  if (op.historicalOperationKind) {
+    payload.ВидОперации = op.historicalOperationKind;
+  }
+
+  // Договор — привязываем, только если найден однозначно. Если у
+  // контрагента несколько договоров и непонятно, какой из них — лучше
+  // остановиться и попросить вас выбрать вручную, чем угадать неверно.
+  if (op.contractStatus === 'ambiguous') {
+    throw new Error('У контрагента несколько договоров, и не удалось определить нужный по назначению платежа — выберите договор вручную перед подтверждением.');
+  }
+  if (op.contractKey) {
+    payload.Договор_Key = op.contractKey;
+  }
 
   if (!op.counterpartyKey) {
     throw new Error('Контрагент не сопоставлен со справочником 1С — сначала выберите контрагента вручную');
