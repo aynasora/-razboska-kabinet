@@ -97,6 +97,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .pill{display:inline-block;font-size:11.5px;padding:3px 9px;border-radius:20px;font-weight:500;}
   .pill-review{background:var(--brass-soft);color:#7A5F2B;}
   .pill-approved{background:var(--green-soft);color:var(--green-text);}
+  .pill-new{background:var(--red-soft);color:var(--red);}
   .icon-btn{border:1px solid var(--line);background:#fff;border-radius:6px;padding:6px 10px;font-size:12.5px;cursor:pointer;}
   .icon-btn.confirm{background:var(--green);border-color:var(--green);color:#fff;}
   .empty{text-align:center;padding:60px 20px;color:var(--muted);}
@@ -129,6 +130,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     <div class="nav">
       <div class="nav-item active" data-view="review"><span>Проверка</span><span class="count" id="review-count">0</span></div>
       <div class="nav-item" data-view="history"><span>История</span></div>
+      <div class="nav-item" data-view="rules"><span>Правила</span></div>
       <div class="nav-item" data-view="settings"><span>Настройки</span></div>
     </div>
     <div class="rail-foot">
@@ -153,8 +155,8 @@ const HTML_PAGE = `<!DOCTYPE html>
           <p>Подтверждение создаёт документ в 1С без проведения. Проводите сами после проверки.</p>
         </div>
         <div class="table-card"><table>
-          <thead><tr><th>Дата</th><th>Контрагент</th><th>Назначение</th><th>Сумма</th><th>Статус</th><th></th></tr></thead>
-          <tbody id="review-tbody"><tr><td colspan="6" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
+          <thead><tr><th>Дата</th><th>Контрагент</th><th>Назначение</th><th>Сумма</th><th>Категория</th><th>Статус</th><th></th></tr></thead>
+          <tbody id="review-tbody"><tr><td colspan="7" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
         </table></div>
       </div>
     </div>
@@ -165,6 +167,38 @@ const HTML_PAGE = `<!DOCTYPE html>
         <div class="table-card"><table>
           <thead><tr><th>Время</th><th>Действие</th><th>Документ</th></tr></thead>
           <tbody id="history-tbody"><tr><td colspan="3" class="empty">Пока пусто</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div class="view hidden" id="view-rules">
+      <div class="topbar"><div><div class="eyebrow">Категоризация</div><h1>Правила</h1></div></div>
+      <div class="view-body" style="padding:28px 32px 0;max-width:720px;">
+        <p style="font-size:12.5px;color:var(--muted);margin:-6px 0 18px;">Правило вида: если в назначении платежа (или в имени контрагента) есть такой-то текст — предложить такую-то категорию. Правила применяются сразу, без перезагрузки выписки.</p>
+        <div class="settings-card" style="max-width:none;">
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
+            <div style="flex:1;min-width:140px;">
+              <label>Проверять поле</label>
+              <select id="r-field" style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:13px;">
+                <option value="purpose">Назначение платежа</option>
+                <option value="counterparty">Имя контрагента</option>
+              </select>
+            </div>
+            <div style="flex:2;min-width:180px;">
+              <label>Содержит текст</label>
+              <input id="r-contains" placeholder="например: аренда">
+            </div>
+            <div style="flex:2;min-width:180px;">
+              <label>Категория</label>
+              <input id="r-category" placeholder="например: Аренда офиса">
+            </div>
+            <button class="btn btn-primary" style="margin-bottom:12px;" onclick="addRule()">Добавить</button>
+          </div>
+          <span id="rules-msg" style="font-size:12.5px;color:var(--muted);"></span>
+        </div>
+        <div class="table-card"><table>
+          <thead><tr><th>Поле</th><th>Содержит</th><th>Категория</th><th></th></tr></thead>
+          <tbody id="rules-tbody"><tr><td colspan="4" class="empty">Правил пока нет</td></tr></tbody>
         </table></div>
       </div>
     </div>
@@ -229,6 +263,7 @@ async function loadAll(){
   await loadSettings();
   await loadOperations();
   await loadHistory();
+  await loadRules();
 }
 
 async function loadSettings(){
@@ -261,17 +296,30 @@ async function loadOperations(){
   tbody.innerHTML = '';
   const pending = ops.filter(o=>o.status!=='draft_created');
   document.getElementById('review-count').textContent = pending.length;
-  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="6" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
+  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="7" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
   ops.forEach(o=>{
     const tr = document.createElement('tr');
     const done = o.status==='draft_created';
+    const isNew = o.status==='new_counterparty';
+    let statusHtml, actionHtml;
+    if(done){
+      statusHtml = '<span class="pill pill-approved">Черновик создан</span>';
+      actionHtml = '';
+    } else if(isNew){
+      statusHtml = '<span class="pill pill-new">Новый контрагент</span>';
+      actionHtml = '<button class="icon-btn" onclick="createCounterparty(\\''+o.id+'\\')">Создать контрагента</button>';
+    } else {
+      statusHtml = '<span class="pill pill-review">На проверке</span>';
+      actionHtml = '<button class="icon-btn confirm" onclick="confirmOp(\\''+o.id+'\\')">Подтвердить</button>';
+    }
     tr.innerHTML = \`
       <td class="mono" style="color:var(--muted)">\${o.date}</td>
       <td>\${o.counterparty || '—'}</td>
       <td style="max-width:220px;color:var(--muted)">\${o.purpose}</td>
       <td class="mono \${o.amount>0?'amt-in':'amt-out'}">\${money(o.amount)}</td>
-      <td><span class="pill \${done?'pill-approved':'pill-review'}">\${done?'Черновик создан':'На проверке'}</span></td>
-      <td>\${done?'':'<button class="icon-btn confirm" onclick="confirmOp(\\''+o.id+'\\')">Подтвердить</button>'}</td>
+      <td style="color:var(--muted)">\${o.suggestedCategory || '—'}</td>
+      <td>\${statusHtml}</td>
+      <td>\${actionHtml}</td>
     \`;
     tbody.appendChild(tr);
   });
@@ -282,6 +330,50 @@ async function confirmOp(id){
     await api('/api/operations/'+id+'/confirm', {method:'POST'});
     loadOperations(); loadHistory();
   }catch(e){ alert(e.message); }
+}
+
+async function createCounterparty(id){
+  try{
+    await api('/api/operations/'+id+'/create-counterparty', {method:'POST'});
+    loadOperations(); loadHistory();
+  }catch(e){ alert(e.message); }
+}
+
+async function loadRules(){
+  const rules = await api('/api/rules');
+  const tbody = document.getElementById('rules-tbody');
+  tbody.innerHTML = '';
+  if(rules.length===0){ tbody.innerHTML = '<tr><td colspan="4" class="empty">Правил пока нет</td></tr>'; return; }
+  rules.forEach(r=>{
+    const tr = document.createElement('tr');
+    const fieldLabel = r.field==='counterparty' ? 'Имя контрагента' : 'Назначение платежа';
+    tr.innerHTML = \`
+      <td>\${fieldLabel}</td>
+      <td>\${r.contains}</td>
+      <td>\${r.category}</td>
+      <td><button class="icon-btn" onclick="deleteRule('\${r.id}')">Удалить</button></td>
+    \`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function addRule(){
+  const field = document.getElementById('r-field').value;
+  const contains = document.getElementById('r-contains').value.trim();
+  const category = document.getElementById('r-category').value.trim();
+  const msg = document.getElementById('rules-msg');
+  try{
+    await api('/api/rules', {method:'POST', body: JSON.stringify({field, contains, category})});
+    document.getElementById('r-contains').value = '';
+    document.getElementById('r-category').value = '';
+    msg.textContent = 'Правило добавлено';
+    loadRules(); loadOperations();
+  }catch(e){ msg.textContent = e.message; }
+}
+
+async function deleteRule(id){
+  await api('/api/rules/'+id, {method:'DELETE'});
+  loadRules(); loadOperations();
 }
 
 async function doUpload(file){
@@ -340,6 +432,20 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(path.join(DATA_DIR, 'operations.json'))) writeJson('operations.json', []);
 if (!fs.existsSync(path.join(DATA_DIR, 'history.json'))) writeJson('history.json', []);
 if (!fs.existsSync(path.join(DATA_DIR, 'settings.json'))) writeJson('settings.json', { baseUrl: '', login: '', password: '' });
+if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) writeJson('rules.json', []);
+
+// Применяет ваши правила категоризации к операции: смотрит назначение
+// платежа и/или имя контрагента, и если находит совпадение — возвращает
+// название категории. Правила проверяются по порядку, первое совпадение побеждает.
+function applyRules(op, rules) {
+  for (const rule of rules) {
+    const haystack = (rule.field === 'counterparty' ? op.counterparty : op.purpose) || '';
+    if (haystack.toLowerCase().includes(String(rule.contains || '').toLowerCase())) {
+      return rule.category;
+    }
+  }
+  return '';
+}
 
 // ---------- вход по паролю (сессия в памяти сервера) ----------
 const sessions = new Map(); // token -> expiry
@@ -389,7 +495,7 @@ app.post('/api/settings', requireAuth, (req, res) => {
 });
 
 // ---------- загрузка и разбор выписки (.xlsx) ----------
-app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Файл не получен' });
 
   let grid;
@@ -508,12 +614,43 @@ app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
   writeJson('operations.json', updated);
   addHistory(`Загружена выписка ${req.file.originalname} · ${operations.length} операций`, '—');
 
+  // Сразу пытаемся сопоставить контрагентов по БИН/ИИН со справочником 1С —
+  // если подключение уже настроено. Если контрагент не найден, операция
+  // помечается статусом new_counterparty и требует отдельного подтверждения
+  // на создание нового контрагента (см. /api/operations/:id/create-counterparty).
+  const settingsForMatch = readJson('settings.json', {});
+  if (settingsForMatch.baseUrl && settingsForMatch.login) {
+    for (const op of operations) {
+      if (!op.bin) continue;
+      try {
+        const found = await findCounterpartyByBin(op.bin, settingsForMatch);
+        const target = updated.find(o => o.id === op.id);
+        if (found) {
+          target.counterpartyKey = found.Ref_Key;
+          target.counterpartyMatchedName = found.Description || '';
+        } else {
+          target.status = 'new_counterparty';
+        }
+      } catch (e) {
+        // Если проверка не удалась (например, неверный пароль) — не блокируем
+        // загрузку, просто оставляем операцию как есть, на проверке.
+      }
+    }
+    writeJson('operations.json', updated);
+  }
+
   res.json({ operations });
 });
 
 // ---------- список операций на проверку ----------
 app.get('/api/operations', requireAuth, (req, res) => {
-  res.json(readJson('operations.json', []));
+  const ops = readJson('operations.json', []);
+  const rules = readJson('rules.json', []);
+  // Категория считается "на лету" по текущим правилам — если вы добавите
+  // или измените правило, категории в уже загруженных операциях
+  // пересчитаются сразу же, без повторной загрузки файла.
+  const withCategories = ops.map(op => ({ ...op, suggestedCategory: applyRules(op, rules) }));
+  res.json(withCategories);
 });
 
 // ---------- подтверждение операции: создать черновик в 1С ----------
@@ -540,7 +677,74 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
   }
 });
 
+// ---------- создание НОВОГО контрагента (отдельное подтверждение) ----------
+app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res) => {
+  const all = readJson('operations.json', []);
+  const op = all.find(o => o.id === req.params.id);
+  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
+  if (!op.bin) return res.status(400).json({ error: 'У операции не указан БИН/ИИН — сопоставьте контрагента вручную' });
+
+  const settings = readJson('settings.json', {});
+  if (!settings.baseUrl) {
+    return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
+  }
+
+  try {
+    // На всякий случай проверяем ещё раз прямо перед созданием — вдруг
+    // контрагент уже появился в 1С (например, кто-то создал его вручную).
+    const existing = await findCounterpartyByBin(op.bin, settings);
+    let key, name;
+    if (existing) {
+      key = existing.Ref_Key;
+      name = existing.Description;
+    } else {
+      const created = await createCounterpartyInOnec(op, settings);
+      key = created.Ref_Key;
+      name = created.Description;
+    }
+    op.counterpartyKey = key;
+    op.counterpartyMatchedName = name;
+    op.status = 'review'; // теперь контрагент есть — можно подтверждать документ как обычно
+    writeJson('operations.json', all);
+    addHistory(`Создан контрагент в 1С: ${name || op.counterparty} (БИН ${op.bin})`, '—');
+    res.json({ ok: true, op });
+  } catch (e) {
+    addHistory(`Ошибка при создании контрагента: ${e.message}`, '—');
+    res.status(502).json({ error: 'Не удалось создать контрагента в 1С: ' + e.message });
+  }
+});
+
 // ---------- история ----------
+// ---------- правила категоризации (редактируются прямо в кабинете) ----------
+app.get('/api/rules', requireAuth, (req, res) => {
+  res.json(readJson('rules.json', []));
+});
+
+app.post('/api/rules', requireAuth, (req, res) => {
+  const { field, contains, category } = req.body;
+  if (!contains || !category) {
+    return res.status(400).json({ error: 'Заполните и условие, и категорию' });
+  }
+  const rules = readJson('rules.json', []);
+  rules.push({
+    id: crypto.randomUUID(),
+    field: field === 'counterparty' ? 'counterparty' : 'purpose',
+    contains: String(contains),
+    category: String(category),
+  });
+  writeJson('rules.json', rules);
+  addHistory(`Добавлено правило: "${contains}" → ${category}`, '—');
+  res.json(rules);
+});
+
+app.delete('/api/rules/:id', requireAuth, (req, res) => {
+  const rules = readJson('rules.json', []);
+  const filtered = rules.filter(r => r.id !== req.params.id);
+  writeJson('rules.json', filtered);
+  addHistory('Удалено правило категоризации', '—');
+  res.json(filtered);
+});
+
 app.get('/api/history', requireAuth, (req, res) => {
   res.json(readJson('history.json', []));
 });
@@ -548,6 +752,53 @@ function addHistory(action, doc) {
   const h = readJson('history.json', []);
   h.unshift({ time: new Date().toISOString(), action, doc });
   writeJson('history.json', h.slice(0, 500));
+}
+
+// Ищет контрагента в справочнике 1С по БИН/ИИН через OData.
+// Возвращает объект контрагента (с Ref_Key) или null, если не найден.
+async function findCounterpartyByBin(bin, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const filter = encodeURIComponent(`БИН eq '${bin}' or ИИН eq '${bin}' or ИННЮЛ eq '${bin}' or ИННФЛ eq '${bin}'`);
+  const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}`;
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Поиск контрагента: 1С ответила ${response.status}: ${text.slice(0, 200)}`);
+  }
+  const data = await response.json().catch(() => ({}));
+  const list = data.value || [];
+  return list.length > 0 ? list[0] : null;
+}
+
+// Создаёт нового контрагента в справочнике 1С по данным из операции выписки.
+async function createCounterpartyInOnec(op, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+
+  const payload = {
+    Description: op.counterparty || op.bin,
+    БИН: op.bin,
+    Комментарий: 'Создан автоматически · личный кабинет разноски выписок',
+  };
+
+  const response = await fetch(`${base}/Catalog_Контрагенты?$format=json`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
+  }
+  return response.json().catch(() => ({}));
 }
 
 // =====================================================================
