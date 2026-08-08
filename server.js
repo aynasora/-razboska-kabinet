@@ -702,6 +702,17 @@ if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) {
 // счёт расчётов / счёт авансов, как в самой 1С:
 //   покупатель платит нам  → 1210 (расчёты) / 3510 (авансы), статья «Реализация работ и услуг»
 //   мы платим поставщику   → 3310 (расчёты) / 1710 (авансы), статья «Расчёты с поставщиками и подрядчиками»
+// Дата у нас хранится как ДД.ММ.ГГГГ (как в банковской выписке), а OData
+// в 1С ожидает международный формат ГГГГ-ММ-ДДTчч:мм:сс — переводим перед
+// отправкой в 1С, иначе она отвечает «Не удалось разобрать строку как
+// значение типа Edm.DateTime».
+function toIsoDate(dateStr) {
+  const parts = String(dateStr).split('.');
+  if (parts.length !== 3) return dateStr; // уже похоже на другой формат — не трогаем
+  const [day, month, year] = parts;
+  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T00:00:00`;
+}
+
 function baseDefault(amount) {
   return amount >= 0
     ? { category: 'Реализация работ и услуг', account: '1210/3510' }
@@ -1575,7 +1586,7 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
 
   const payload = {
-    Date: op.date,
+    Date: toIsoDate(op.date),
     Posted: false, // черновик — не проводится автоматически
     Организация_Key: settings.orgKey || '',
     СчетОрганизации_Key: settings.accountKey || '',
