@@ -570,24 +570,42 @@ app.post('/api/settings/browse', requireAuth, async (req, res) => {
   const base = baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${login}:${pass}`).toString('base64');
 
-  async function fetchList(catalogName) {
+  async function tryFetchList(catalogName) {
     const response = await fetch(`${base}/${catalogName}?$format=json&$select=Ref_Key,Description&$top=100`, {
       headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
     });
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`${catalogName}: 1С ответила ${response.status}: ${text.slice(0, 200)}`);
-    }
-    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return null; // пробуем следующий вариант названия
+    const data = await response.json().catch(() => null);
+    if (!data) return null;
     return (data.value || []).map(x => ({ key: x.Ref_Key, name: x.Description }));
   }
 
+  // Названия справочников отличаются между конфигурациями 1С (РФ/КЗ,
+  // Бухгалтерия/ERP/УТ) — пробуем самые частые варианты по очереди.
+  async function fetchFirstMatch(catalogNames) {
+    for (const name of catalogNames) {
+      const result = await tryFetchList(name);
+      if (result !== null) return { name, result };
+    }
+    return null;
+  }
+
   try {
-    const [organizations, accounts] = await Promise.all([
-      fetchList('Catalog_Организации'),
-      fetchList('Catalog_БанковскиеСчета'),
+    const orgMatch = await fetchFirstMatch(['Catalog_Организации']);
+    if (!orgMatch) {
+      return res.status(502).json({ error: 'Не удалось найти справочник организаций (Catalog_Организации). Проверьте логин/пароль/адрес.' });
+    }
+    const accMatch = await fetchFirstMatch([
+      'Catalog_БанковскиеСчета',
+      'Catalog_БанковскиеСчетаОрганизаций',
+      'Catalog_РасчетныеСчета',
+      'Catalog_РасчётныеСчета',
+      'Catalog_СчетаОрганизаций',
     ]);
-    res.json({ organizations, accounts });
+    if (!accMatch) {
+      return res.status(502).json({ error: 'Организации нашлись, но не удалось найти справочник расчётных счетов ни под одним из известных названий. Уточните у вашего 1С-специалиста точное имя справочника счетов, и я добавлю его в список.' });
+    }
+    res.json({ organizations: orgMatch.result, accounts: accMatch.result, accountCatalogUsed: accMatch.name });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
