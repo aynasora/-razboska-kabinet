@@ -263,6 +263,7 @@ const HTML_PAGE = `<!DOCTYPE html>
           </div>
           <div id="current-org-account" style="font-size:12px;color:var(--muted);margin-top:10px;"></div>
         </div>
+        <div id="env-hint" class="hidden" style="border:1px solid var(--brass);background:var(--brass-soft);border-radius:var(--radius);padding:16px;font-size:12.5px;color:#5c4826;margin-bottom:20px;line-height:1.7;"></div>
         <div class="limits">
           <h3 style="margin:0 0 12px;font-size:14.5px;">Ограничения текущего режима</h3>
           <ul>
@@ -370,7 +371,24 @@ async function saveSettings(){
     msg.textContent = 'Сохранено';
     document.getElementById('s-pass').value='';
     loadSettings();
+    showEnvVarHint(body);
   }catch(e){ msg.textContent = e.message; }
+}
+
+function showEnvVarHint(body){
+  const box = document.getElementById('env-hint');
+  if(!box) return;
+  const lines = [
+    'ONEC_BASE_URL = ' + body.baseUrl,
+    'ONEC_LOGIN = ' + body.login,
+    body.password ? 'ONEC_PASSWORD = (тот пароль, что вы ввели)' : null,
+    body.orgKey ? 'ONEC_ORG_KEY = ' + body.orgKey : null,
+    body.orgName ? 'ONEC_ORG_NAME = ' + body.orgName : null,
+    body.accountKey ? 'ONEC_ACCOUNT_KEY = ' + body.accountKey : null,
+    body.accountName ? 'ONEC_ACCOUNT_NAME = ' + body.accountName : null,
+  ].filter(Boolean);
+  box.innerHTML = '<b>Чтобы это не слетало при каждом обновлении сайта — добавьте эти переменные один раз в Render (Environment → Add Environment Variable):</b><br><br>' + lines.join('<br>');
+  box.classList.remove('hidden');
 }
 
 function money(v){ const sign = v>0?'+':''; return sign + v.toLocaleString('ru-RU') + ' \\u20B8'; }
@@ -394,8 +412,21 @@ async function loadOperations(){
 
   if(ops.length===0){ list.innerHTML = '<div class="empty">Загрузите файл выписки, чтобы начать</div>'; return; }
 
+  // Требующие вашего решения — всегда сверху; уже обработанные — вниз,
+  // чтобы не приходилось искать проблемные операции среди сотен готовых.
+  const priority = (o) => {
+    if(o.status==='new_counterparty') return 0;
+    if(o.status==='review' && !o.suggestedCategory) return 0;
+    if(o.contractStatus==='ambiguous') return 0;
+    if(o.status==='review') return 1;
+    if(o.status==='already_in_1c') return 2;
+    if(o.status==='draft_created') return 3;
+    return 1;
+  };
+  const sorted = [...ops].sort((a,b)=>priority(a)-priority(b));
+
   list.innerHTML = '';
-  ops.forEach(o=>{
+  sorted.forEach(o=>{
     const done = o.status==='draft_created';
     const isNew = o.status==='new_counterparty';
     const already = o.status==='already_in_1c';
@@ -586,8 +617,32 @@ function writeJson(file, data) {
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(path.join(DATA_DIR, 'operations.json'))) writeJson('operations.json', []);
 if (!fs.existsSync(path.join(DATA_DIR, 'history.json'))) writeJson('history.json', []);
-if (!fs.existsSync(path.join(DATA_DIR, 'settings.json'))) writeJson('settings.json', { baseUrl: '', login: '', password: '' });
 if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) writeJson('rules.json', []);
+
+// ВАЖНО: файлы в data/ стираются при каждой пересборке на бесплатном
+// плане Render (диск не постоянный). Чтобы подключение к 1С не терялось
+// при каждом обновлении кода, настройки при старте сервера в первую
+// очередь берутся из переменных окружения Render (Environment) — они,
+// в отличие от файлов, сохраняются между пересборками. Если вы один раз
+// сохраните подключение через кабинет, сообщение подскажет, что именно
+// добавить в Environment на Render, чтобы это стало постоянным.
+const envSettings = {
+  baseUrl: process.env.ONEC_BASE_URL || '',
+  login: process.env.ONEC_LOGIN || '',
+  password: process.env.ONEC_PASSWORD || '',
+  orgKey: process.env.ONEC_ORG_KEY || '',
+  orgName: process.env.ONEC_ORG_NAME || '',
+  accountKey: process.env.ONEC_ACCOUNT_KEY || '',
+  accountName: process.env.ONEC_ACCOUNT_NAME || '',
+};
+if (!fs.existsSync(path.join(DATA_DIR, 'settings.json'))) {
+  writeJson('settings.json', envSettings.baseUrl ? envSettings : { baseUrl: '', login: '', password: '' });
+} else if (envSettings.baseUrl) {
+  // Файл есть (сервер уже работал в эту сессию), но если в нём почему-то
+  // пусто, а в переменных окружения есть данные — восстанавливаем из них.
+  const current = readJson('settings.json', {});
+  if (!current.baseUrl) writeJson('settings.json', envSettings);
+}
 
 // Применяет ваши правила категоризации к операции: смотрит назначение
 // платежа и/или имя контрагента, и если находит совпадение — возвращает
@@ -1281,7 +1336,7 @@ async function createDraftInOnec(op, settings) {
     Контрагент_Key: op.counterpartyKey || '', // если контрагент не найден — не отправляем, см. ниже
     СуммаДокумента: Math.abs(op.amount),
     НазначениеПлатежа: op.purpose,
-    Комментарий: 'Черновик создан автоматически · личный кабинет разноски выписок',
+    Комментарий: op.purpose, // должно совпадать с назначением платежа, как в вашей 1С
   };
 
   // Если для этого контрагента нашлась статья ДДС / вид операции по прошлым
