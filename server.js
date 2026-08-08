@@ -432,6 +432,12 @@ async function loadOperations(){
     const already = o.status==='already_in_1c';
     const hasCategory = !!o.suggestedCategory;
     const contractAmbiguous = o.contractStatus === 'ambiguous';
+    // Бывает, что операция загружена ДО того, как подключение к 1С было
+    // настроено — тогда сопоставление контрагента не выполнялось вообще,
+    // но статус остался обычным "review". Без реального Ref_Key
+    // контрагента документ в 1С создать нельзя — блокируем и предлагаем
+    // пересверить.
+    const missingCounterparty = !done && !already && !isNew && !o.counterpartyKey;
     let statusHtml, actionHtml;
     if(done){
       statusHtml = '<span class="pill pill-approved">Черновик создан</span>';
@@ -442,6 +448,9 @@ async function loadOperations(){
     } else if(isNew){
       statusHtml = '<span class="pill pill-new">Новый контрагент</span>';
       actionHtml = '<button class="icon-btn" onclick="event.stopPropagation();createCounterparty(\\''+o.id+'\\')">Создать контрагента</button>';
+    } else if(missingCounterparty){
+      statusHtml = '<span class="pill pill-new">Контрагент не сверен</span>';
+      actionHtml = '<button class="icon-btn" onclick="event.stopPropagation();rematchOp(\\''+o.id+'\\')">Пересверить с 1С</button>';
     } else if(!hasCategory){
       statusHtml = '<span class="pill pill-new">Нет статьи ДДС</span>';
       actionHtml = '<button class="icon-btn" disabled title="Сначала определите статью ДДС в разделе «Правила»" style="opacity:0.5;cursor:not-allowed;">Подтвердить</button>';
@@ -536,6 +545,13 @@ async function confirmOp(id){
 async function createCounterparty(id){
   try{
     await api('/api/operations/'+id+'/create-counterparty', {method:'POST'});
+    loadOperations(); loadHistory();
+  }catch(e){ alert(e.message); }
+}
+
+async function rematchOp(id){
+  try{
+    await api('/api/operations/'+id+'/rematch', {method:'POST'});
     loadOperations(); loadHistory();
   }catch(e){ alert(e.message); }
 }
@@ -657,28 +673,39 @@ if (!fs.existsSync(path.join(DATA_DIR, 'history.json'))) writeJson('history.json
 // Создаются один раз, если у вас ещё нет ни одного правила — дальше вы можете
 // их редактировать или удалять как обычные правила в разделе «Правила».
 const DEFAULT_RULES = [
-  { field: 'purpose', contains: 'аренд', category: 'Аренда', account: '3360' },
+  { field: 'purpose', contains: 'аренд', category: 'Аренда', account: '3360/1710' },
   { field: 'purpose', contains: 'зарплат', category: 'Заработная плата', account: '3350' },
   { field: 'purpose', contains: 'налог', category: 'Налоги', account: '3130' },
   { field: 'purpose', contains: 'кпн', category: 'Налоги', account: '3130' },
   { field: 'purpose', contains: 'ипн', category: 'Налоги', account: '3120' },
   { field: 'purpose', contains: 'осмс', category: 'Налоги', account: '3150' },
   { field: 'purpose', contains: 'опвр', category: 'Налоги', account: '3150' },
-  { field: 'purpose', contains: 'комисси', category: 'Банковские услуги', account: '3310' },
-  { field: 'purpose', contains: 'возврат', category: 'Возврат денежных средств', account: '3310' },
+  { field: 'purpose', contains: 'комисси', category: 'Банковские услуги', account: '3310/1710' },
+  { field: 'purpose', contains: 'возврат', category: 'Возврат денежных средств', account: '3310/1710' },
 ];
 if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) {
   writeJson('rules.json', DEFAULT_RULES.map(r => ({ id: crypto.randomUUID(), ...r })));
+} else {
+  // Правила уже были созданы раньше (со старым форматом счёта, без пары
+  // расчёты/авансы) — обновляем совпадающие типовые правила один раз.
+  const existing = readJson('rules.json', []);
+  let changed = false;
+  const upgrades = { '3360': '3360/1710', '3310': '3310/1710' };
+  for (const r of existing) {
+    if (upgrades[r.account]) { r.account = upgrades[r.account]; changed = true; }
+  }
+  if (changed) writeJson('rules.json', existing);
 }
 
 // Базовые счета по регламенту — работают ВСЕГДА, когда более точное правило
-// (историческое или из «Правил») не найдено:
-//   покупатель платит нам  → счёт 1210, статья «Реализация работ и услуг»
-//   мы платим поставщику   → счёт 3310, статья «Расчёты с поставщиками и подрядчиками»
+// (историческое или из «Правил») не найдено. Счёт указывается парой —
+// счёт расчётов / счёт авансов, как в самой 1С:
+//   покупатель платит нам  → 1210 (расчёты) / 3510 (авансы), статья «Реализация работ и услуг»
+//   мы платим поставщику   → 3310 (расчёты) / 1710 (авансы), статья «Расчёты с поставщиками и подрядчиками»
 function baseDefault(amount) {
   return amount >= 0
-    ? { category: 'Реализация работ и услуг', account: '1210' }
-    : { category: 'Расчёты с поставщиками и подрядчиками', account: '3310' };
+    ? { category: 'Реализация работ и услуг', account: '1210/3510' }
+    : { category: 'Расчёты с поставщиками и подрядчиками', account: '3310/1710' };
 }
 
 // ВАЖНО: файлы в data/ стираются при каждой пересборке на бесплатном
@@ -1152,6 +1179,64 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
 });
 
 // ---------- создание НОВОГО контрагента (отдельное подтверждение) ----------
+// ---------- пересверить одну операцию с 1С заново ----------
+// Нужно, когда операция была загружена до того, как подключение к 1С
+// было настроено (или сверка не удалась) — прогоняем ту же логику,
+// что и при первой загрузке, но для одной конкретной операции.
+app.post('/api/operations/:id/rematch', requireAuth, async (req, res) => {
+  const all = readJson('operations.json', []);
+  const op = all.find(o => o.id === req.params.id);
+  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
+
+  const settings = readJson('settings.json', {});
+  if (!settings.baseUrl) {
+    return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
+  }
+
+  try {
+    const alreadyExists = await checkExistingInOnec(op, settings);
+    if (alreadyExists) {
+      op.status = 'already_in_1c';
+      writeJson('operations.json', all);
+      return res.json({ ok: true, op });
+    }
+
+    if (op.bin) {
+      const found = await findCounterpartyByBin(op.bin, settings);
+      if (found) {
+        op.counterpartyKey = found.Ref_Key;
+        op.counterpartyMatchedName = found.Description || '';
+        op.status = 'review';
+
+        const historical = await findHistoricalCategory(found.Ref_Key, op.amount, settings).catch(() => null);
+        if (historical) {
+          op.historicalCategory = historical.categoryName || '';
+          op.historicalCategoryKey = historical.categoryKey || '';
+          op.historicalOperationKind = historical.operationKind || '';
+        }
+
+        const contract = await findContractForCounterparty(found.Ref_Key, op.purpose, settings).catch(() => null);
+        if (contract) {
+          op.contractStatus = contract.status;
+          if (contract.status === 'matched') {
+            op.contractKey = contract.key;
+            op.contractName = contract.name;
+          } else if (contract.status === 'ambiguous') {
+            op.contractOptions = contract.options;
+          }
+        }
+      } else {
+        op.status = 'new_counterparty';
+      }
+    }
+    writeJson('operations.json', all);
+    addHistory(`Пересверено с 1С: ${op.counterparty || 'операция'}`, '—');
+    res.json({ ok: true, op });
+  } catch (e) {
+    res.status(502).json({ error: 'Не удалось пересверить: ' + e.message });
+  }
+});
+
 app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res) => {
   const all = readJson('operations.json', []);
   const op = all.find(o => o.id === req.params.id);
