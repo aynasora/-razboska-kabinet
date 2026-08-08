@@ -155,8 +155,8 @@ const HTML_PAGE = `<!DOCTYPE html>
           <p>Подтверждение создаёт документ в 1С без проведения. Проводите сами после проверки.</p>
         </div>
         <div class="table-card"><table>
-          <thead><tr><th>Дата</th><th>Контрагент</th><th>Назначение</th><th>Сумма</th><th>Категория</th><th>Статус</th><th></th></tr></thead>
-          <tbody id="review-tbody"><tr><td colspan="7" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
+          <thead><tr><th>Дата</th><th>Контрагент</th><th>БИН/ИИН</th><th>Назначение</th><th>Сумма</th><th>Категория</th><th>Статус</th><th></th></tr></thead>
+          <tbody id="review-tbody"><tr><td colspan="8" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
         </table></div>
       </div>
     </div>
@@ -296,7 +296,7 @@ async function loadOperations(){
   tbody.innerHTML = '';
   const pending = ops.filter(o=>o.status!=='draft_created');
   document.getElementById('review-count').textContent = pending.length;
-  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="7" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
+  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="8" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
   ops.forEach(o=>{
     const tr = document.createElement('tr');
     const done = o.status==='draft_created';
@@ -315,6 +315,7 @@ async function loadOperations(){
     tr.innerHTML = \`
       <td class="mono" style="color:var(--muted)">\${o.date}</td>
       <td>\${o.counterparty || '—'}</td>
+      <td class="mono" style="color:var(--muted)">\${o.bin || '—'}</td>
       <td style="max-width:220px;color:var(--muted)">\${o.purpose}</td>
       <td class="mono \${o.amount>0?'amt-in':'amt-out'}">\${money(o.amount)}</td>
       <td style="color:var(--muted)">\${o.suggestedCategory || '—'}</td>
