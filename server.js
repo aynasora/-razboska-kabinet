@@ -207,14 +207,27 @@ const HTML_PAGE = `<!DOCTYPE html>
       <div class="topbar"><div><div class="eyebrow">Подключение</div><h1>Настройки</h1></div></div>
       <div class="view-body" style="padding:28px 32px 0;">
         <div class="settings-card">
-          <label>Адрес REST-сервиса 1С</label>
-          <input id="s-url" placeholder="https://ваш-домен/hs/bank/create">
+          <label>Адрес OData вашей базы 1С</label>
+          <input id="s-url" placeholder="https://1cfresh.kz/a/xxxxx/xxxxxx/odata/standard.odata/">
           <label>Логин</label>
-          <input id="s-login" placeholder="rest_user">
+          <input id="s-login" placeholder="логин">
           <label>Пароль (оставьте пустым, если не меняете)</label>
           <input id="s-pass" type="password" placeholder="••••••••">
-          <button class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
-          <span id="settings-msg" style="font-size:12.5px;color:var(--muted);margin-left:10px;"></span>
+          <button class="btn btn-ghost" onclick="browseOnec()">Проверить подключение</button>
+          <span id="browse-msg" style="font-size:12.5px;color:var(--muted);margin-left:10px;"></span>
+
+          <div id="org-account-pickers" class="hidden" style="margin-top:16px;">
+            <label>Организация</label>
+            <select id="s-org" style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-bottom:12px;"></select>
+            <label>Расчётный счёт</label>
+            <select id="s-account" style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:13px;"></select>
+          </div>
+
+          <div style="margin-top:16px;">
+            <button class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
+            <span id="settings-msg" style="font-size:12.5px;color:var(--muted);margin-left:10px;"></span>
+          </div>
+          <div id="current-org-account" style="font-size:12px;color:var(--muted);margin-top:10px;"></div>
         </div>
         <div class="limits">
           <h3 style="margin:0 0 12px;font-size:14.5px;">Ограничения текущего режима</h3>
@@ -266,22 +279,60 @@ async function loadAll(){
   await loadRules();
 }
 
+let lastSettings = {};
+
 async function loadSettings(){
   const s = await api('/api/settings');
+  lastSettings = s;
   document.getElementById('s-url').value = s.baseUrl || '';
   document.getElementById('s-login').value = s.login || '';
   const dot = document.getElementById('conn-dot');
   const text = document.getElementById('conn-text');
   if(s.baseUrl && s.passwordSet){ dot.classList.remove('off'); text.textContent = 'Подключение настроено'; }
   else { dot.classList.add('off'); text.textContent = 'Подключение не настроено'; }
+  const orgAccInfo = document.getElementById('current-org-account');
+  if(s.orgName || s.accountName){
+    orgAccInfo.textContent = 'Сейчас выбрано: ' + (s.orgName||'—') + ' · ' + (s.accountName||'—');
+  } else {
+    orgAccInfo.textContent = 'Организация и счёт ещё не выбраны — нажмите «Проверить подключение».';
+  }
 }
+
+async function browseOnec(){
+  const baseUrl = document.getElementById('s-url').value.trim();
+  const login = document.getElementById('s-login').value.trim();
+  const password = document.getElementById('s-pass').value;
+  const msg = document.getElementById('browse-msg');
+  msg.textContent = 'Проверяю…';
+  try{
+    const result = await api('/api/settings/browse', {method:'POST', body: JSON.stringify({baseUrl, login, password})});
+    msg.textContent = 'Подключение работает, найдено: организаций — ' + result.organizations.length + ', счетов — ' + result.accounts.length;
+    const orgSel = document.getElementById('s-org');
+    const accSel = document.getElementById('s-account');
+    orgSel.innerHTML = result.organizations.map(o => \`<option value="\${o.key}">\${o.name}</option>\`).join('');
+    accSel.innerHTML = result.accounts.map(a => \`<option value="\${a.key}">\${a.name}</option>\`).join('');
+    document.getElementById('org-account-pickers').classList.remove('hidden');
+  }catch(e){ msg.textContent = 'Ошибка: ' + e.message; }
+}
+
 async function saveSettings(){
   const baseUrl = document.getElementById('s-url').value.trim();
   const login = document.getElementById('s-login').value.trim();
   const password = document.getElementById('s-pass').value;
   const msg = document.getElementById('settings-msg');
+  const body = {baseUrl, login, password};
+  const orgSel = document.getElementById('s-org');
+  const accSel = document.getElementById('s-account');
+  if(orgSel.options.length){
+    body.orgKey = orgSel.value;
+    body.orgName = orgSel.options[orgSel.selectedIndex].text;
+  }
+  if(accSel.options.length){
+    body.accountKey = accSel.value;
+    body.accountName = accSel.options[accSel.selectedIndex].text;
+  }
   try{
-    await api('/api/settings', {method:'POST', body: JSON.stringify({baseUrl, login, password})});
+    await api('/api/settings', {method:'POST', body: JSON.stringify(body)});
     msg.textContent = 'Сохранено';
     document.getElementById('s-pass').value='';
     loadSettings();
@@ -480,19 +531,66 @@ app.post('/api/logout', requireAuth, (req, res) => {
 app.get('/api/settings', requireAuth, (req, res) => {
   const s = readJson('settings.json', {});
   // пароль наружу не отдаём, только признак "задан/не задан"
-  res.json({ baseUrl: s.baseUrl || '', login: s.login || '', passwordSet: !!s.password });
+  res.json({
+    baseUrl: s.baseUrl || '',
+    login: s.login || '',
+    passwordSet: !!s.password,
+    orgKey: s.orgKey || '',
+    orgName: s.orgName || '',
+    accountKey: s.accountKey || '',
+    accountName: s.accountName || '',
+  });
 });
 
 app.post('/api/settings', requireAuth, (req, res) => {
-  const { baseUrl, login, password } = req.body;
+  const { baseUrl, login, password, orgKey, orgName, accountKey, accountName } = req.body;
   const current = readJson('settings.json', {});
   writeJson('settings.json', {
     baseUrl: baseUrl ?? current.baseUrl,
     login: login ?? current.login,
     password: password || current.password, // пустое поле = пароль не менять
+    orgKey: orgKey ?? current.orgKey,
+    orgName: orgName ?? current.orgName,
+    accountKey: accountKey ?? current.accountKey,
+    accountName: accountName ?? current.accountName,
   });
   addHistory('Обновлены настройки подключения к 1С', '—');
   res.json({ ok: true });
+});
+
+// Проверяет подключение к 1С и возвращает список организаций и расчётных
+// счетов, чтобы их можно было выбрать из выпадающего списка, не зная GUID.
+app.post('/api/settings/browse', requireAuth, async (req, res) => {
+  const { baseUrl, login, password } = req.body;
+  if (!baseUrl || !login) {
+    return res.status(400).json({ error: 'Укажите адрес и логин перед проверкой' });
+  }
+  const current = readJson('settings.json', {});
+  const pass = password || current.password;
+  const base = baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${login}:${pass}`).toString('base64');
+
+  async function fetchList(catalogName) {
+    const response = await fetch(`${base}/${catalogName}?$format=json&$select=Ref_Key,Description&$top=100`, {
+      headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`${catalogName}: 1С ответила ${response.status}: ${text.slice(0, 200)}`);
+    }
+    const data = await response.json().catch(() => ({}));
+    return (data.value || []).map(x => ({ key: x.Ref_Key, name: x.Description }));
+  }
+
+  try {
+    const [organizations, accounts] = await Promise.all([
+      fetchList('Catalog_Организации'),
+      fetchList('Catalog_БанковскиеСчета'),
+    ]);
+    res.json({ organizations, accounts });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // ---------- загрузка и разбор выписки (.xlsx) ----------
