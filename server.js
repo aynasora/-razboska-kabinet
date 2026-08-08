@@ -392,46 +392,116 @@ app.post('/api/settings', requireAuth, (req, res) => {
 app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Файл не получен' });
 
-  let rows;
+  let grid;
+  let workbook;
   try {
-    const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    // header:1 → читаем как массив строк-массивов, без угадывания заголовков —
+    // многие банковские выписки (например БЦК/Kaspi) кладут перед таблицей
+    // несколько строк с реквизитами банка, поэтому настоящую шапку таблицы
+    // нужно искать, а не считать первой строкой.
+    grid = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
   } catch (e) {
     return res.status(400).json({ error: 'Не получилось прочитать файл: ' + e.message });
   }
 
-  // Разбор строк выписки. Названия колонок в реальных выписках сильно
-  // различаются по банкам — здесь распознаются самые частые варианты.
-  // Если ваш банк называет колонки иначе, пришлите пример файла,
-  // допишем сопоставление.
-  const pick = (row, names) => {
-    for (const n of names) {
-      const key = Object.keys(row).find(k => k.trim().toLowerCase() === n);
-      if (key) return row[key];
+  const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+  // Ищем строку-шапку: она содержит одновременно что-то похожее на "дата"
+  // и что-то похожее на дебет/кредит/сумму.
+  let headerRowIndex = -1;
+  let cols = {};
+  for (let r = 0; r < Math.min(grid.length, 40); r++) {
+    const cells = (grid[r] || []).map(norm);
+    const findCol = (test) => cells.findIndex(test);
+    const dateCol = findCol(c => c.includes('дата') && !c.includes('валют'));
+    const debitCol = findCol(c => c.includes('дебет'));
+    const creditCol = findCol(c => c.includes('кредит') && !c.includes('корреспондент'));
+    const amountCol = findCol(c => c.includes('сумма') && !c.includes('конверт'));
+    if (dateCol !== -1 && (debitCol !== -1 || creditCol !== -1 || amountCol !== -1)) {
+      headerRowIndex = r;
+      cols = {
+        date: dateCol,
+        debit: debitCol,
+        credit: creditCol,
+        amount: amountCol,
+        purpose: findCol(c => c.includes('мақсат') || c.includes('назначен') || c.includes('комментарий')),
+        counterparty: findCol(c => c.includes('корреспондент') && !c.includes('банк') && !c.includes('бик') && !c.includes('иик')),
+        senderBin: findCol(c => (c.includes('бин') || c.includes('иин')) && c.includes('отправ')),
+        receiverBin: findCol(c => (c.includes('бин') || c.includes('иин')) && c.includes('получ')),
+        binGeneric: findCol(c => c.includes('бин') || c.includes('иин')),
+      };
+      break;
     }
-    return '';
+  }
+
+  let operations = [];
+  const parseAmount = (v) => {
+    if (v === '' || v === undefined || v === null) return 0;
+    const s = String(v).replace(/\s/g, '').replace(',', '.');
+    const n = parseFloat(s);
+    return isNaN(n) ? 0 : n;
   };
 
-  const operations = rows.map((row, i) => {
-    const dateRaw = pick(row, ['дата', 'дата операции', 'дата документа']);
-    const amountIn = parseFloat(pick(row, ['приход', 'сумма прихода', 'дебет']) || 0) || 0;
-    const amountOut = parseFloat(pick(row, ['расход', 'сумма расхода', 'кредит']) || 0) || 0;
-    const amountSingle = parseFloat(pick(row, ['сумма']) || 0) || 0;
-    const amount = amountIn || (amountOut ? -amountOut : amountSingle);
-    return {
-      id: crypto.randomUUID(),
-      date: String(dateRaw || ''),
-      counterparty: String(pick(row, ['контрагент', 'наименование контрагента', 'плательщик/получатель']) || ''),
-      bin: String(pick(row, ['бин', 'иин', 'бин/иин']) || ''),
-      purpose: String(pick(row, ['назначение платежа', 'назначение', 'комментарий']) || ''),
-      amount,
-      suggestedCategory: '', // сюда позже подключится ИИ-категоризация
-      status: 'review', // review | new_counterparty | confirmed | draft_created
-      sourceFile: req.file.originalname,
-      rowIndex: i,
+  if (headerRowIndex !== -1) {
+    // Формат с "шапкой банка" + двуязычными заголовками (БЦК, Kaspi Business и похожие)
+    for (let r = headerRowIndex + 1; r < grid.length; r++) {
+      const row = grid[r];
+      if (!row || row.every(c => String(c).trim() === '')) continue;
+      const debit = cols.debit !== -1 ? parseAmount(row[cols.debit]) : 0;
+      const credit = cols.credit !== -1 ? parseAmount(row[cols.credit]) : 0;
+      const single = cols.amount !== -1 ? parseAmount(row[cols.amount]) : 0;
+      const amount = credit || (debit ? -debit : single);
+      const dateRaw = cols.date !== -1 ? String(row[cols.date] || '') : '';
+      if (!dateRaw && !amount) continue;
+      const bin = credit
+        ? (cols.senderBin !== -1 ? row[cols.senderBin] : row[cols.binGeneric])
+        : (cols.receiverBin !== -1 ? row[cols.receiverBin] : row[cols.binGeneric]);
+      operations.push({
+        id: crypto.randomUUID(),
+        date: dateRaw.split(' ')[0] || dateRaw,
+        counterparty: cols.counterparty !== -1 ? String(row[cols.counterparty] || '') : '',
+        bin: String(bin || ''),
+        purpose: cols.purpose !== -1 ? String(row[cols.purpose] || '') : '',
+        amount,
+        suggestedCategory: '',
+        status: 'review',
+        sourceFile: req.file.originalname,
+        rowIndex: r,
+      });
+    }
+  } else {
+    // Запасной вариант: простые выписки, где заголовки — в самой первой строке
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const objRows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    const pick = (row, names) => {
+      for (const n of names) {
+        const key = Object.keys(row).find(k => k.trim().toLowerCase() === n);
+        if (key) return row[key];
+      }
+      return '';
     };
-  }).filter(op => op.date || op.amount);
+    operations = objRows.map((row, i) => {
+      const dateRaw = pick(row, ['дата', 'дата операции', 'дата документа']);
+      const amountIn = parseFloat(pick(row, ['приход', 'сумма прихода']) || 0) || 0;
+      const amountOut = parseFloat(pick(row, ['расход', 'сумма расхода']) || 0) || 0;
+      const amountSingle = parseFloat(pick(row, ['сумма']) || 0) || 0;
+      const amount = amountIn || (amountOut ? -amountOut : amountSingle);
+      return {
+        id: crypto.randomUUID(),
+        date: String(dateRaw || ''),
+        counterparty: String(pick(row, ['контрагент', 'наименование контрагента', 'плательщик/получатель']) || ''),
+        bin: String(pick(row, ['бин', 'иин', 'бин/иин']) || ''),
+        purpose: String(pick(row, ['назначение платежа', 'назначение', 'комментарий']) || ''),
+        amount,
+        suggestedCategory: '',
+        status: 'review',
+        sourceFile: req.file.originalname,
+        rowIndex: i,
+      };
+    }).filter(op => op.date || op.amount);
+  }
 
   const all = readJson('operations.json', []);
   const updated = [...all, ...operations];
