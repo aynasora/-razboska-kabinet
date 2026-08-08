@@ -91,6 +91,24 @@ const HTML_PAGE = `<!DOCTYPE html>
   .table-card{border:1px solid var(--line);border-radius:var(--radius);overflow-x:auto;background:#fff;}
   .table-card table{min-width:920px;}
   .purpose-cell{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);cursor:help;}
+
+  .op-list{display:flex;flex-direction:column;gap:8px;}
+  .op-row{border:1px solid var(--line);border-radius:10px;background:#fff;overflow:hidden;}
+  .op-row-header{display:flex;align-items:center;gap:14px;padding:13px 16px;cursor:pointer;flex-wrap:wrap;}
+  .op-row-header:hover{background:var(--paper-2);}
+  .op-main{flex:1;min-width:0;}
+  .op-name{font-weight:500;font-size:13.5px;}
+  .op-meta{font-size:11.5px;color:var(--muted);margin-top:2px;}
+  .op-purpose-line{font-size:12px;color:var(--muted);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .op-amount{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums;flex-shrink:0;text-align:right;min-width:100px;font-size:13.5px;}
+  .op-chevron{flex-shrink:0;color:var(--muted);transition:transform .15s;font-size:12px;}
+  .op-row.expanded .op-chevron{transform:rotate(180deg);}
+  .op-details{display:none;padding:0 16px 16px;border-top:1px solid var(--line-soft);background:var(--paper-2);}
+  .op-row.expanded .op-details{display:block;}
+  .op-detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0;}
+  .op-detail-item label{font-size:11px;color:var(--muted);display:block;margin-bottom:2px;text-transform:uppercase;letter-spacing:0.03em;}
+  .op-detail-item div{font-size:13px;}
+  .op-detail-full{grid-column:1/-1;}
   table{width:100%;border-collapse:collapse;}
   th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:0.04em;color:var(--muted);font-weight:500;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--paper-2);}
   td{padding:13px 16px;border-bottom:1px solid var(--line-soft);font-size:13.5px;vertical-align:middle;}
@@ -158,10 +176,7 @@ const HTML_PAGE = `<!DOCTYPE html>
           <p>Подтверждение создаёт документ в 1С без проведения. Проводите сами после проверки.</p>
         </div>
         <div id="review-summary" style="font-size:12.5px;color:var(--muted);margin-bottom:12px;"></div>
-        <div class="table-card"><table>
-          <thead><tr><th>Дата</th><th>Контрагент</th><th>БИН/ИИН</th><th>Назначение</th><th>КНП</th><th>Сумма</th><th>Статья ДДС</th><th>Счёт</th><th>Договор</th><th>Статус</th><th></th></tr></thead>
-          <tbody id="review-tbody"><tr><td colspan="11" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
-        </table></div>
+        <div id="review-list" class="op-list"><div class="empty">Загрузите файл выписки, чтобы начать</div></div>
       </div>
     </div>
 
@@ -360,10 +375,11 @@ async function saveSettings(){
 
 function money(v){ const sign = v>0?'+':''; return sign + v.toLocaleString('ru-RU') + ' \\u20B8'; }
 
+const expandedOps = new Set();
+
 async function loadOperations(){
   const ops = await api('/api/operations');
-  const tbody = document.getElementById('review-tbody');
-  tbody.innerHTML = '';
+  const list = document.getElementById('review-list');
   const pending = ops.filter(o=>o.status==='review' || o.status==='new_counterparty');
   document.getElementById('review-count').textContent = pending.length;
 
@@ -376,9 +392,10 @@ async function loadOperations(){
       : '';
   }
 
-  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="11" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
+  if(ops.length===0){ list.innerHTML = '<div class="empty">Загрузите файл выписки, чтобы начать</div>'; return; }
+
+  list.innerHTML = '';
   ops.forEach(o=>{
-    const tr = document.createElement('tr');
     const done = o.status==='draft_created';
     const isNew = o.status==='new_counterparty';
     const already = o.status==='already_in_1c';
@@ -393,7 +410,7 @@ async function loadOperations(){
       actionHtml = '';
     } else if(isNew){
       statusHtml = '<span class="pill pill-new">Новый контрагент</span>';
-      actionHtml = '<button class="icon-btn" onclick="createCounterparty(\\''+o.id+'\\')">Создать контрагента</button>';
+      actionHtml = '<button class="icon-btn" onclick="event.stopPropagation();createCounterparty(\\''+o.id+'\\')">Создать контрагента</button>';
     } else if(!hasCategory){
       statusHtml = '<span class="pill pill-new">Нет статьи ДДС</span>';
       actionHtml = '<button class="icon-btn" disabled title="Сначала определите статью ДДС в разделе «Правила»" style="opacity:0.5;cursor:not-allowed;">Подтвердить</button>';
@@ -402,26 +419,45 @@ async function loadOperations(){
       actionHtml = '<button class="icon-btn" disabled title="У контрагента несколько договоров — нужен ручной выбор" style="opacity:0.5;cursor:not-allowed;">Подтвердить</button>';
     } else {
       statusHtml = '<span class="pill pill-review">На проверке</span>';
-      actionHtml = '<button class="icon-btn confirm" onclick="confirmOp(\\''+o.id+'\\')">Подтвердить</button>';
+      actionHtml = '<button class="icon-btn confirm" onclick="event.stopPropagation();confirmOp(\\''+o.id+'\\')">Подтвердить</button>';
     }
-    const contractCell = contractAmbiguous
-      ? '<span style="color:var(--red)">несколько — выбрать</span>'
-      : (o.contractName || '—');
-    tr.innerHTML = \`
-      <td class="mono" style="color:var(--muted)">\${o.date}</td>
-      <td>\${o.counterparty || '—'}</td>
-      <td class="mono" style="color:var(--muted)">\${o.bin || '—'}</td>
-      <td class="purpose-cell" title="\${o.purpose.replace(/"/g,'&quot;')}">\${o.purpose}</td>
-      <td class="mono" style="color:var(--muted)">\${o.knp || '—'}</td>
-      <td class="mono \${o.amount>0?'amt-in':'amt-out'}">\${money(o.amount)}</td>
-      <td style="color:\${hasCategory?'var(--ink)':'var(--red)'}">\${o.suggestedCategory || 'не определена'}</td>
-      <td class="mono" style="color:var(--muted)">\${o.suggestedAccount || '—'}</td>
-      <td style="font-size:12.5px;">\${contractCell}</td>
-      <td>\${statusHtml}</td>
-      <td>\${actionHtml}</td>
+    const contractText = contractAmbiguous ? '<span style="color:var(--red)">несколько — выбрать вручную</span>' : (o.contractName || '—');
+    const isExpanded = expandedOps.has(o.id);
+
+    const row = document.createElement('div');
+    row.className = 'op-row' + (isExpanded ? ' expanded' : '');
+    row.innerHTML = \`
+      <div class="op-row-header" onclick="toggleOpRow('\${o.id}')">
+        <div class="op-main">
+          <div class="op-name">\${o.counterparty || '—'}</div>
+          <div class="op-meta">\${o.date} · КНП \${o.knp || '—'} · БИН \${o.bin || '—'}</div>
+          <div class="op-purpose-line" title="\${o.purpose.replace(/"/g,'&quot;')}">\${o.purpose}</div>
+        </div>
+        <div class="op-amount \${o.amount>0?'amt-in':'amt-out'}">\${money(o.amount)}</div>
+        \${statusHtml}
+        <div style="min-width:0;">\${actionHtml}</div>
+        <div class="op-chevron">▾</div>
+      </div>
+      <div class="op-details">
+        <div class="op-detail-grid">
+          <div class="op-detail-item"><label>Статья ДДС</label><div style="color:\${hasCategory?'var(--ink)':'var(--red)'}">\${o.suggestedCategory || 'не определена'}</div></div>
+          <div class="op-detail-item"><label>Счёт</label><div class="mono">\${o.suggestedAccount || '—'}</div></div>
+          <div class="op-detail-item"><label>Договор</label><div>\${contractText}</div></div>
+          <div class="op-detail-item"><label>КНП</label><div class="mono">\${o.knp || '—'}</div></div>
+          <div class="op-detail-item op-detail-full"><label>Полное назначение платежа</label><div>\${o.purpose}</div></div>
+        </div>
+      </div>
     \`;
-    tbody.appendChild(tr);
+    list.appendChild(row);
   });
+}
+
+function toggleOpRow(id){
+  if(expandedOps.has(id)) expandedOps.delete(id); else expandedOps.add(id);
+  const rows = document.querySelectorAll('.op-row');
+  loadOperations.lastToggled = id;
+  // просто перерисовываем список — состояние "раскрыто" хранится в expandedOps
+  loadOperations();
 }
 
 async function confirmOp(id){
