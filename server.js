@@ -28,8 +28,304 @@ const DATA_DIR = path.join(__dirname, 'data');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.use(express.json());
+
 app.use(cookieParser());
-app.use(express.static(path.join(__dirname, 'public')));
+
+const HTML_PAGE = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Разноска · Выписки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#161A16; --paper:#FAFAF7; --paper-2:#F1F0EA; --line:#DEDCD2; --line-soft:#EAE8DF;
+    --green:#2F5D45; --green-soft:#E3ECE4; --green-text:#1F4432;
+    --brass:#9C7A3C; --brass-soft:#F3EBDA; --red:#A23B2E; --red-soft:#F5E4E0; --muted:#726F63; --radius:10px;
+    font-family:'Inter',sans-serif;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--paper);color:var(--ink);}
+  h1,h2,h3,.display{font-family:'Fraunces',serif;font-weight:500;letter-spacing:-0.01em;}
+  .mono{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums;}
+
+  /* Login */
+  #login-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;}
+  .login-box{width:340px;border:1px solid var(--line);border-radius:var(--radius);padding:28px;background:#fff;}
+  .login-box h1{font-size:20px;margin:0 0 4px;}
+  .login-box p{font-size:13px;color:var(--muted);margin:0 0 18px;}
+  .login-box input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;margin-bottom:12px;}
+  .login-box button{width:100%;padding:10px;border:none;border-radius:8px;background:var(--green);color:#fff;font-weight:500;font-size:14px;cursor:pointer;}
+  .login-err{color:var(--red);font-size:12.5px;min-height:16px;margin-top:8px;}
+
+  .app{display:flex;min-height:100vh;}
+  .rail{width:236px;flex-shrink:0;border-right:1px solid var(--line);padding:24px 16px;display:flex;flex-direction:column;}
+  .brand{display:flex;align-items:center;gap:10px;padding:4px 8px 22px;}
+  .brand-mark{width:32px;height:32px;border-radius:8px;background:var(--green);color:#fff;display:flex;align-items:center;justify-content:center;font-family:'Fraunces',serif;font-size:15px;font-weight:600;flex-shrink:0;}
+  .brand-name{font-size:14.5px;font-weight:600;line-height:1.25;}
+  .brand-sub{font-size:12px;color:var(--muted);}
+  .nav{display:flex;flex-direction:column;gap:2px;}
+  .nav-item{display:flex;align-items:center;justify-content:space-between;padding:9px 10px;border-radius:8px;font-size:14px;cursor:pointer;color:var(--muted);}
+  .nav-item:hover{background:var(--paper-2);color:var(--ink);}
+  .nav-item.active{background:var(--green-soft);color:var(--green-text);font-weight:500;}
+  .nav-item .count{font-size:11.5px;background:var(--brass);color:#fff;border-radius:20px;padding:1px 7px;font-family:'IBM Plex Mono',monospace;}
+  .rail-foot{margin-top:auto;padding-top:16px;border-top:1px solid var(--line-soft);}
+  .status-chip{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);padding:6px 8px;}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0;}
+  .dot.off{background:var(--red);}
+  .logout-link{font-size:12.5px;color:var(--muted);cursor:pointer;padding:6px 8px;display:block;}
+
+  .main{flex:1;min-width:0;}
+  .topbar{display:flex;align-items:center;justify-content:space-between;padding:22px 32px;border-bottom:1px solid var(--line);}
+  .eyebrow{font-size:11.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
+  .topbar h1{font-size:24px;margin:0;}
+  .btn{border:none;border-radius:8px;padding:10px 16px;font-size:13.5px;font-weight:500;cursor:pointer;font-family:'Inter',sans-serif;}
+  .btn-primary{background:var(--green);color:#fff;}
+  .btn-ghost{background:transparent;border:1px solid var(--line);color:var(--ink);}
+  .view{padding:28px 32px;} .hidden{display:none;}
+  .stamp-banner{display:flex;align-items:center;gap:12px;border:1px solid var(--brass);background:var(--brass-soft);border-radius:var(--radius);padding:12px 16px;margin-bottom:24px;}
+  .stamp{border:1.5px solid var(--brass);color:var(--brass);font-family:'Fraunces',serif;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:3px 9px;border-radius:20px;transform:rotate(-2deg);flex-shrink:0;}
+  .stamp-banner p{margin:0;font-size:13px;color:#5c4826;}
+  .table-card{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:#fff;}
+  table{width:100%;border-collapse:collapse;}
+  th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:0.04em;color:var(--muted);font-weight:500;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--paper-2);}
+  td{padding:13px 16px;border-bottom:1px solid var(--line-soft);font-size:13.5px;vertical-align:middle;}
+  tr:last-child td{border-bottom:none;}
+  .amt-in{color:var(--green-text);} .amt-out{color:var(--red);}
+  .pill{display:inline-block;font-size:11.5px;padding:3px 9px;border-radius:20px;font-weight:500;}
+  .pill-review{background:var(--brass-soft);color:#7A5F2B;}
+  .pill-approved{background:var(--green-soft);color:var(--green-text);}
+  .icon-btn{border:1px solid var(--line);background:#fff;border-radius:6px;padding:6px 10px;font-size:12.5px;cursor:pointer;}
+  .icon-btn.confirm{background:var(--green);border-color:var(--green);color:#fff;}
+  .empty{text-align:center;padding:60px 20px;color:var(--muted);}
+  .settings-card{border:1px solid var(--line);border-radius:var(--radius);padding:20px;background:#fff;margin-bottom:14px;max-width:640px;}
+  .settings-card label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px;}
+  .settings-card input{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:13px;margin-bottom:12px;}
+  .limits{border:1px solid var(--line);border-radius:var(--radius);padding:20px;background:var(--paper-2);max-width:640px;}
+  .limits ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:9px;}
+  .limits li{font-size:13px;display:flex;gap:9px;} .limits li:before{content:"✓";color:var(--green);font-weight:600;}
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-box">
+    <h1>Разноска</h1>
+    <p>Личный кабинет · доступ только по паролю</p>
+    <input type="password" id="login-password" placeholder="Пароль">
+    <button onclick="doLogin()">Войти</button>
+    <div class="login-err" id="login-err"></div>
+  </div>
+</div>
+
+<div class="app hidden" id="app">
+  <div class="rail">
+    <div class="brand">
+      <div class="brand-mark">Р</div>
+      <div><div class="brand-name">Разноска</div><div class="brand-sub">Личный кабинет</div></div>
+    </div>
+    <div class="nav">
+      <div class="nav-item active" data-view="review"><span>Проверка</span><span class="count" id="review-count">0</span></div>
+      <div class="nav-item" data-view="history"><span>История</span></div>
+      <div class="nav-item" data-view="settings"><span>Настройки</span></div>
+    </div>
+    <div class="rail-foot">
+      <div class="status-chip"><span class="dot" id="conn-dot"></span><span id="conn-text">Проверка подключения…</span></div>
+      <div class="logout-link" onclick="doLogout()">Выйти</div>
+    </div>
+  </div>
+
+  <div class="main">
+
+    <div class="view" id="view-review">
+      <div class="topbar">
+        <div><div class="eyebrow">Банковская выписка</div><h1>Проверка операций</h1></div>
+        <div>
+          <button class="btn btn-primary" onclick="document.getElementById('upload-input').click()">+ Загрузить выписку</button>
+          <input type="file" id="upload-input" accept=".xlsx,.xls" style="display:none" onchange="doUpload(this.files[0])">
+        </div>
+      </div>
+      <div class="view-body" style="padding:28px 32px 0;">
+        <div class="stamp-banner">
+          <div class="stamp">Черновик</div>
+          <p>Подтверждение создаёт документ в 1С без проведения. Проводите сами после проверки.</p>
+        </div>
+        <div class="table-card"><table>
+          <thead><tr><th>Дата</th><th>Контрагент</th><th>Назначение</th><th>Сумма</th><th>Статус</th><th></th></tr></thead>
+          <tbody id="review-tbody"><tr><td colspan="6" class="empty">Загрузите файл выписки, чтобы начать</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div class="view hidden" id="view-history">
+      <div class="topbar"><div><div class="eyebrow">Журнал действий</div><h1>История</h1></div></div>
+      <div class="view-body" style="padding:28px 32px 0;">
+        <div class="table-card"><table>
+          <thead><tr><th>Время</th><th>Действие</th><th>Документ</th></tr></thead>
+          <tbody id="history-tbody"><tr><td colspan="3" class="empty">Пока пусто</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div class="view hidden" id="view-settings">
+      <div class="topbar"><div><div class="eyebrow">Подключение</div><h1>Настройки</h1></div></div>
+      <div class="view-body" style="padding:28px 32px 0;">
+        <div class="settings-card">
+          <label>Адрес REST-сервиса 1С</label>
+          <input id="s-url" placeholder="https://ваш-домен/hs/bank/create">
+          <label>Логин</label>
+          <input id="s-login" placeholder="rest_user">
+          <label>Пароль (оставьте пустым, если не меняете)</label>
+          <input id="s-pass" type="password" placeholder="••••••••">
+          <button class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
+          <span id="settings-msg" style="font-size:12.5px;color:var(--muted);margin-left:10px;"></span>
+        </div>
+        <div class="limits">
+          <h3 style="margin:0 0 12px;font-size:14.5px;">Ограничения текущего режима</h3>
+          <ul>
+            <li>Документы создаются только по вашему подтверждению</li>
+            <li>Ни один документ не проводится автоматически</li>
+            <li>Все действия записываются в историю</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+async function api(path, opts={}){
+  const res = await fetch(path, {credentials:'include', headers:{'Content-Type':'application/json'}, ...opts});
+  if(res.status===401){ showLogin(); throw new Error('Требуется вход'); }
+  if(!res.ok){ const e = await res.json().catch(()=>({error:'Ошибка запроса'})); throw new Error(e.error||'Ошибка запроса'); }
+  return res.json();
+}
+
+function showLogin(){
+  document.getElementById('login-screen').classList.remove('hidden');
+  document.getElementById('app').classList.add('hidden');
+}
+function showApp(){
+  document.getElementById('login-screen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  loadAll();
+}
+
+async function doLogin(){
+  const password = document.getElementById('login-password').value;
+  const err = document.getElementById('login-err');
+  err.textContent = '';
+  try{
+    await api('/api/login', {method:'POST', body: JSON.stringify({password})});
+    showApp();
+  }catch(e){ err.textContent = e.message; }
+}
+async function doLogout(){ await api('/api/logout', {method:'POST'}); showLogin(); }
+
+async function loadAll(){
+  await loadSettings();
+  await loadOperations();
+  await loadHistory();
+}
+
+async function loadSettings(){
+  const s = await api('/api/settings');
+  document.getElementById('s-url').value = s.baseUrl || '';
+  document.getElementById('s-login').value = s.login || '';
+  const dot = document.getElementById('conn-dot');
+  const text = document.getElementById('conn-text');
+  if(s.baseUrl && s.passwordSet){ dot.classList.remove('off'); text.textContent = 'Подключение настроено'; }
+  else { dot.classList.add('off'); text.textContent = 'Подключение не настроено'; }
+}
+async function saveSettings(){
+  const baseUrl = document.getElementById('s-url').value.trim();
+  const login = document.getElementById('s-login').value.trim();
+  const password = document.getElementById('s-pass').value;
+  const msg = document.getElementById('settings-msg');
+  try{
+    await api('/api/settings', {method:'POST', body: JSON.stringify({baseUrl, login, password})});
+    msg.textContent = 'Сохранено';
+    document.getElementById('s-pass').value='';
+    loadSettings();
+  }catch(e){ msg.textContent = e.message; }
+}
+
+function money(v){ const sign = v>0?'+':''; return sign + v.toLocaleString('ru-RU') + ' \\u20B8'; }
+
+async function loadOperations(){
+  const ops = await api('/api/operations');
+  const tbody = document.getElementById('review-tbody');
+  tbody.innerHTML = '';
+  const pending = ops.filter(o=>o.status!=='draft_created');
+  document.getElementById('review-count').textContent = pending.length;
+  if(ops.length===0){ tbody.innerHTML = '<tr><td colspan="6" class="empty">Загрузите файл выписки, чтобы начать</td></tr>'; return; }
+  ops.forEach(o=>{
+    const tr = document.createElement('tr');
+    const done = o.status==='draft_created';
+    tr.innerHTML = \`
+      <td class="mono" style="color:var(--muted)">\${o.date}</td>
+      <td>\${o.counterparty || '—'}</td>
+      <td style="max-width:220px;color:var(--muted)">\${o.purpose}</td>
+      <td class="mono \${o.amount>0?'amt-in':'amt-out'}">\${money(o.amount)}</td>
+      <td><span class="pill \${done?'pill-approved':'pill-review'}">\${done?'Черновик создан':'На проверке'}</span></td>
+      <td>\${done?'':'<button class="icon-btn confirm" onclick="confirmOp(\\''+o.id+'\\')">Подтвердить</button>'}</td>
+    \`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function confirmOp(id){
+  try{
+    await api('/api/operations/'+id+'/confirm', {method:'POST'});
+    loadOperations(); loadHistory();
+  }catch(e){ alert(e.message); }
+}
+
+async function doUpload(file){
+  if(!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  const res = await fetch('/api/upload', {method:'POST', credentials:'include', body: fd});
+  if(!res.ok){ const e = await res.json().catch(()=>({})); alert(e.error||'Ошибка загрузки'); return; }
+  loadOperations(); loadHistory();
+}
+
+async function loadHistory(){
+  const h = await api('/api/history');
+  const tbody = document.getElementById('history-tbody');
+  tbody.innerHTML = '';
+  if(h.length===0){ tbody.innerHTML = '<tr><td colspan="3" class="empty">Пока пусто</td></tr>'; return; }
+  h.forEach(item=>{
+    const tr = document.createElement('tr');
+    const t = new Date(item.time).toLocaleString('ru-RU');
+    tr.innerHTML = \`<td class="mono" style="color:var(--muted)">\${t}</td><td>\${item.action}</td><td style="color:var(--muted)">\${item.doc}</td>\`;
+    tbody.appendChild(tr);
+  });
+}
+
+document.querySelectorAll('.nav-item').forEach(item=>{
+  item.addEventListener('click', ()=>{
+    document.querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'));
+    item.classList.add('active');
+    document.querySelectorAll('.view').forEach(v=>v.classList.add('hidden'));
+    document.getElementById('view-'+item.dataset.view).classList.remove('hidden');
+  });
+});
+
+// Пытаемся сразу показать кабинет, если сессия уже есть
+api('/api/settings').then(showApp).catch(()=>showLogin());
+</script>
+</body>
+</html>
+`;
+
+app.get('/', (req, res) => {
+  res.type('html').send(HTML_PAGE);
+});
+// (фронтенд теперь встроен прямо в этот файл — см. HTML_PAGE ниже)
 
 // ---------- простое файловое хранилище (без базы данных) ----------
 function readJson(file, fallback) {
@@ -185,30 +481,47 @@ function addHistory(action, doc) {
 }
 
 // =====================================================================
-// СЮДА нужно вставить настоящий вызов вашего REST-сервиса 1С.
-// Пример ниже — общий шаблон (Basic Auth + JSON), его нужно поправить
-// под точный адрес и формат, который принимает ваш сервис.
+// СЮДА вставлен вызов через OData стандартного интерфейса 1С:Фреш —
+// на основе полей, которые реально видны в вашей базе (Date, Number,
+// Организация_Key, СчетОрганизации_Key, Контрагент_Key, ВидОперации,
+// СтатьяДвиженияДенежныхСредств_Key, СуммаДокумента, НазначениеПлатежа).
+//
+// settings.baseUrl должен быть вида:
+//   https://1cfresh.kz/a/ea170/264256/odata/standard.odata/
+// (без имени документа на конце — его добавляем здесь).
+//
+// ВАЖНО: Организация_Key и СчетОрганизации_Key — это GUID-идентификаторы
+// вашей организации и расчётного счёта в справочниках 1С. Их нужно один
+// раз узнать (через тот же OData: .../Catalog_Организации?$format=json)
+// и вписать в настройки — без них документ не создать.
 // =====================================================================
 async function createDraftInOnec(op, settings) {
-  const endpoint = settings.baseUrl; // например: https://ваш-домен/hs/bank/create
+  const base = settings.baseUrl.replace(/\/+$/, ''); // убираем лишний / на конце
+  const docType = op.amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
+  const endpoint = `${base}/${docType}`;
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
 
   const payload = {
-    Дата: op.date,
-    Проведен: false, // черновик — не проводится автоматически
-    Сумма: Math.abs(op.amount),
-    ВидОперации: op.amount >= 0 ? 'ПлатежноеПоручениеВходящее' : 'ПлатежноеПоручениеИсходящее',
-    Контрагент: op.counterparty,
-    БИН: op.bin,
+    Date: op.date,
+    Posted: false, // черновик — не проводится автоматически
+    Организация_Key: settings.orgKey || '',
+    СчетОрганизации_Key: settings.accountKey || '',
+    Контрагент_Key: op.counterpartyKey || '', // если контрагент не найден — не отправляем, см. ниже
+    СуммаДокумента: Math.abs(op.amount),
     НазначениеПлатежа: op.purpose,
     Комментарий: 'Черновик создан автоматически · личный кабинет разноски выписок',
   };
 
-  const response = await fetch(endpoint, {
+  if (!op.counterpartyKey) {
+    throw new Error('Контрагент не сопоставлен со справочником 1С — сначала выберите контрагента вручную');
+  }
+
+  const response = await fetch(`${endpoint}?$format=json`, {
     method: 'POST',
     headers: {
       Authorization: `Basic ${auth}`,
       'Content-Type': 'application/json',
+      Accept: 'application/json',
     },
     body: JSON.stringify(payload),
   });
@@ -219,7 +532,7 @@ async function createDraftInOnec(op, settings) {
   }
 
   const data = await response.json().catch(() => ({}));
-  return { docNumber: data.Номер || data.number || null };
+  return { docNumber: data.Number || null };
 }
 
 app.listen(PORT, () => {
