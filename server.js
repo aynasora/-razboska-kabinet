@@ -1600,14 +1600,13 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   // Если она текстовая (из ваших правил или ручной правки) — ищем такую
   // статью по названию в самом справочнике 1С, чтобы подставить настоящий
   // GUID, а не просто текст.
-  if (op.historicalCategoryKey) {
-    payload.СтатьяДвиженияДенежныхСредств_Key = op.historicalCategoryKey;
-  } else if (resolvedCategory) {
-    const key = await findCategoryKeyByName(resolvedCategory, settings);
-    if (key) payload.СтатьяДвиженияДенежныхСредств_Key = key;
+  let categoryKey = op.historicalCategoryKey || null;
+  if (!categoryKey && resolvedCategory) {
+    categoryKey = await findCategoryKeyByName(resolvedCategory, settings);
     // Если не нашли даже по имени — не страшно: текст статьи уже есть в
     // комментарии и в интерфейсе, вы сможете проставить её вручную в 1С.
   }
+  if (categoryKey) payload.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
   if (op.historicalOperationKind) {
     payload.ВидОперации = op.historicalOperationKind;
   }
@@ -1622,23 +1621,55 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
     payload.Договор_Key = op.contractKey;
   }
 
+  // ВАЖНО: сумма, статья ДДС и договор в этом документе хранятся не
+  // только на уровне самого документа, но и в отдельной табличной части
+  // "Расшифровка платежа" (видна как таблица внутри документа в 1С).
+  // Без нее табличная часть остаётся пустой строкой, даже если общая
+  // сумма наверху документа заполнена правильно.
+  const amountAbs = Math.abs(op.amount);
+  payload.РасшифровкаПлатежа = [{
+    LineNumber: 1,
+    Договор_Key: op.contractKey || '',
+    СуммаПлатежа: amountAbs,
+    КурсВзаиморасчетов: 1,
+    СуммаВзаиморасчетов: amountAbs,
+    СтатьяДвиженияДенежныхСредств_Key: categoryKey || '',
+  }];
+
   if (!op.counterpartyKey) {
     throw new Error('Контрагент не сопоставлен со справочником 1С — сначала выберите контрагента вручную');
   }
 
-  const response = await fetch(`${endpoint}?$format=json`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
+  async function postDocument(body) {
+    return fetch(`${endpoint}?$format=json`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  let response = await postDocument(payload);
 
   if (!response.ok) {
     const text = await response.text().catch(() => '');
-    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
+    // Если 1С не приняла именно табличную часть "РасшифровкаПлатежа"
+    // (например, в вашей конфигурации она называется иначе) — пробуем
+    // создать документ без неё, чтобы он хотя бы появился как черновик,
+    // а таблицу внутри можно будет дозаполнить вручную в 1С.
+    if (text.includes('РасшифровкаПлатежа')) {
+      const { РасшифровкаПлатежа, ...withoutTable } = payload;
+      response = await postDocument(withoutTable);
+      if (!response.ok) {
+        const text2 = await response.text().catch(() => '');
+        throw new Error(`1С ответила ${response.status}: ${text2.slice(0, 300)}`);
+      }
+    } else {
+      throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
+    }
   }
 
   const data = await response.json().catch(() => ({}));
