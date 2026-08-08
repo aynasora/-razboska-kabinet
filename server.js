@@ -454,6 +454,7 @@ async function loadOperations(){
     }
     const contractText = contractAmbiguous ? '<span style="color:var(--red)">несколько — выбрать вручную</span>' : (o.contractName || '—');
     const isExpanded = expandedOps.has(o.id);
+    const defaultHint = o.isDefaultOnly ? ' <span style="color:var(--brass);font-size:11px;">(по умолчанию — проверьте)</span>' : '';
 
     const row = document.createElement('div');
     row.className = 'op-row' + (isExpanded ? ' expanded' : '');
@@ -471,16 +472,50 @@ async function loadOperations(){
       </div>
       <div class="op-details">
         <div class="op-detail-grid">
-          <div class="op-detail-item"><label>Статья ДДС</label><div style="color:\${hasCategory?'var(--ink)':'var(--red)'}">\${o.suggestedCategory || 'не определена'}</div></div>
-          <div class="op-detail-item"><label>Счёт</label><div class="mono">\${o.suggestedAccount || '—'}</div></div>
+          <div class="op-detail-item">
+            <label>Статья ДДС\${defaultHint}</label>
+            <input class="edit-input" id="cat-\${o.id}" value="\${(o.suggestedCategory||'').replace(/"/g,'&quot;')}" style="width:100%;padding:6px 8px;border:1px solid \${hasCategory?'var(--line)':'var(--red)'};border-radius:6px;font-size:13px;">
+          </div>
+          <div class="op-detail-item">
+            <label>Счёт</label>
+            <input class="edit-input mono" id="acc-\${o.id}" value="\${(o.suggestedAccount||'').replace(/"/g,'&quot;')}" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;">
+          </div>
           <div class="op-detail-item"><label>Договор</label><div>\${contractText}</div></div>
           <div class="op-detail-item"><label>КНП</label><div class="mono">\${o.knp || '—'}</div></div>
           <div class="op-detail-item op-detail-full"><label>Полное назначение платежа</label><div>\${o.purpose}</div></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px;">
+          <button class="btn btn-ghost" style="padding:7px 12px;font-size:12.5px;" onclick="event.stopPropagation();saveOverride('\${o.id}', false)">Сохранить правку</button>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer;">
+            <input type="checkbox" id="rule-\${o.id}"> запомнить как правило для похожих операций
+          </label>
+          <span id="override-msg-\${o.id}" style="font-size:12px;color:var(--muted);"></span>
         </div>
       </div>
     \`;
     list.appendChild(row);
   });
+}
+
+async function saveOverride(id, silent){
+  const category = document.getElementById('cat-'+id).value.trim();
+  const account = document.getElementById('acc-'+id).value.trim();
+  const rememberBox = document.getElementById('rule-'+id);
+  const remember = rememberBox && rememberBox.checked;
+  const msg = document.getElementById('override-msg-'+id);
+  const body = { category, account };
+  if(remember){
+    // Простое ключевое слово для правила — берём то, что вы ввели как статью,
+    // это надёжнее, чем гадать по всему тексту назначения платежа.
+    body.saveAsRule = true;
+    body.ruleContains = category;
+    body.ruleField = 'purpose';
+  }
+  try{
+    const result = await api('/api/operations/'+id+'/override', {method:'POST', body: JSON.stringify(body)});
+    if(msg) msg.textContent = result.ruleAdded ? 'Сохранено и запомнено как правило' : 'Сохранено';
+    loadOperations();
+  }catch(e){ if(msg) msg.textContent = e.message; }
 }
 
 function toggleOpRow(id){
@@ -617,7 +652,34 @@ function writeJson(file, data) {
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(path.join(DATA_DIR, 'operations.json'))) writeJson('operations.json', []);
 if (!fs.existsSync(path.join(DATA_DIR, 'history.json'))) writeJson('history.json', []);
-if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) writeJson('rules.json', []);
+
+// Типовые правила по регламенту («Правила ИИ-помощника 1С — Банк / ДДС / расчёты»).
+// Создаются один раз, если у вас ещё нет ни одного правила — дальше вы можете
+// их редактировать или удалять как обычные правила в разделе «Правила».
+const DEFAULT_RULES = [
+  { field: 'purpose', contains: 'аренд', category: 'Аренда', account: '3360' },
+  { field: 'purpose', contains: 'зарплат', category: 'Заработная плата', account: '3350' },
+  { field: 'purpose', contains: 'налог', category: 'Налоги', account: '3130' },
+  { field: 'purpose', contains: 'кпн', category: 'Налоги', account: '3130' },
+  { field: 'purpose', contains: 'ипн', category: 'Налоги', account: '3120' },
+  { field: 'purpose', contains: 'осмс', category: 'Налоги', account: '3150' },
+  { field: 'purpose', contains: 'опвр', category: 'Налоги', account: '3150' },
+  { field: 'purpose', contains: 'комисси', category: 'Банковские услуги', account: '3310' },
+  { field: 'purpose', contains: 'возврат', category: 'Возврат денежных средств', account: '3310' },
+];
+if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) {
+  writeJson('rules.json', DEFAULT_RULES.map(r => ({ id: crypto.randomUUID(), ...r })));
+}
+
+// Базовые счета по регламенту — работают ВСЕГДА, когда более точное правило
+// (историческое или из «Правил») не найдено:
+//   покупатель платит нам  → счёт 1210, статья «Реализация работ и услуг»
+//   мы платим поставщику   → счёт 3310, статья «Расчёты с поставщиками и подрядчиками»
+function baseDefault(amount) {
+  return amount >= 0
+    ? { category: 'Реализация работ и услуг', account: '1210' }
+    : { category: 'Расчёты с поставщиками и подрядчиками', account: '3310' };
+}
 
 // ВАЖНО: файлы в data/ стираются при каждой пересборке на бесплатном
 // плане Render (диск не постоянный). Чтобы подключение к 1С не терялось
@@ -646,15 +708,19 @@ if (!fs.existsSync(path.join(DATA_DIR, 'settings.json'))) {
 
 // Применяет ваши правила категоризации к операции: смотрит назначение
 // платежа и/или имя контрагента, и если находит совпадение — возвращает
-// категорию и счёт. Правила проверяются по порядку, первое совпадение побеждает.
+// категорию и счёт. Правила проверяются по порядку, первое совпадение
+// побеждает. Если ни одно правило не подошло — возвращает базовую логику
+// «покупатель/поставщик» по регламенту, а не пустоту: минимум статья по
+// направлению платежа должна быть определена всегда.
 function applyRules(op, rules) {
   for (const rule of rules) {
     const haystack = (rule.field === 'counterparty' ? op.counterparty : op.purpose) || '';
     if (haystack.toLowerCase().includes(String(rule.contains || '').toLowerCase())) {
-      return { category: rule.category || '', account: rule.account || '' };
+      return { category: rule.category || '', account: rule.account || '', source: 'rule' };
     }
   }
-  return { category: '', account: '' };
+  const base = baseDefault(op.amount);
+  return { ...base, source: 'default' };
 }
 
 // ---------- вход по паролю (сессия в памяти сервера) ----------
@@ -987,25 +1053,69 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
 app.get('/api/operations', requireAuth, (req, res) => {
   const ops = readJson('operations.json', []);
   const rules = readJson('rules.json', []);
-  // Категория/счёт считаются "на лету" по текущим правилам — если вы
-  // добавите или измените правило, категории в уже загруженных операциях
-  // пересчитаются сразу же, без повторной загрузки файла. Историческая
-  // категория из 1С (по прошлым документам контрагента) — приоритетнее.
+  // Приоритет определения статьи ДДС и счёта:
+  //   1. Ваша ручная правка (если поправили в кабинете) — самый высокий приоритет
+  //   2. История 1С (как этот контрагент разносился раньше)
+  //   3. Ваши правила из раздела «Правила» (включая типовые из регламента)
+  //   4. Базовая логика покупатель/поставщик по регламенту (всегда есть)
   const withCategories = ops.map(op => {
     const ruleMatch = applyRules(op, rules);
-    const category = op.historicalCategory || ruleMatch.category;
-    const account = op.historicalAccount || ruleMatch.account;
+    const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
+    const account = op.manualAccount || op.historicalAccount || ruleMatch.account;
+    const isDefaultOnly = !op.manualCategory && !op.historicalCategory && ruleMatch.source === 'default';
     return {
       ...op,
       suggestedCategory: category,
       suggestedAccount: account,
-      needsAttention: !category, // ДДС обязательна — если не определена, операцию нельзя тихо подтверждать
+      isDefaultOnly, // категория определена только базовой логикой, стоит перепроверить глазами
+      needsAttention: !category,
     };
   });
   res.json(withCategories);
 });
 
 // ---------- подтверждение операции: создать черновик в 1С ----------
+// ---------- ручная правка операции перед подтверждением ----------
+// Позволяет поправить статью ДДС / счёт / договор прямо в карточке, до
+// создания документа в 1С. Если saveAsRule=true — тут же создаётся правило,
+// чтобы в следующий раз похожая операция определилась автоматически
+// (самообучение на ваших правках).
+app.post('/api/operations/:id/override', requireAuth, (req, res) => {
+  const all = readJson('operations.json', []);
+  const op = all.find(o => o.id === req.params.id);
+  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
+
+  const { category, account, contractKey, contractName, saveAsRule, ruleContains, ruleField } = req.body;
+
+  if (category !== undefined) op.manualCategory = String(category || '');
+  if (account !== undefined) op.manualAccount = String(account || '');
+  if (contractKey !== undefined) {
+    op.contractKey = contractKey || null;
+    op.contractName = contractName || '';
+    op.contractStatus = contractKey ? 'matched' : op.contractStatus;
+  }
+  writeJson('operations.json', all);
+
+  let ruleAdded = false;
+  if (saveAsRule && ruleContains && (category || account)) {
+    const rules = readJson('rules.json', []);
+    rules.unshift({
+      id: crypto.randomUUID(),
+      field: ruleField === 'counterparty' ? 'counterparty' : 'purpose',
+      contains: String(ruleContains),
+      category: String(category || ''),
+      account: String(account || ''),
+    });
+    writeJson('rules.json', rules);
+    ruleAdded = true;
+    addHistory(`Сохранено новое правило по вашей правке: "${ruleContains}" → ${category || ''} ${account ? '(счёт ' + account + ')' : ''}`, '—');
+  } else {
+    addHistory(`Ручная правка операции: ${op.counterparty || 'операция'} · статья: ${category || '—'}, счёт: ${account || '—'}`, '—');
+  }
+
+  res.json({ ok: true, op, ruleAdded });
+});
+
 app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
   const all = readJson('operations.json', []);
   const op = all.find(o => o.id === req.params.id);
@@ -1016,18 +1126,20 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
   }
 
-  // Статья ДДС обязательна — без неё документ не создаём, даже если
-  // контрагент найден. Либо она должна прийти из истории 1С, либо из
-  // ваших правил категоризации.
+  // Статья ДДС обязательна — без неё документ не создаём. Приоритет:
+  // ручная правка > история 1С > правила > базовая логика (которая
+  // всегда что-то определяет, так что пусто может быть, только если
+  // что-то совсем не так с данными).
   const rules = readJson('rules.json', []);
   const ruleMatch = applyRules(op, rules);
-  const category = op.historicalCategory || ruleMatch.category;
+  const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
+  const account = op.manualAccount || op.historicalAccount || ruleMatch.account;
   if (!category) {
-    return res.status(400).json({ error: 'Не определена статья ДДС — добавьте правило категоризации (раздел «Правила») или дождитесь исторического сопоставления, прежде чем подтверждать.' });
+    return res.status(400).json({ error: 'Не определена статья ДДС — поправьте вручную в карточке операции, прежде чем подтверждать.' });
   }
 
   try {
-    const result = await createDraftInOnec(op, settings);
+    const result = await createDraftInOnec(op, settings, category, account);
     op.status = 'draft_created';
     op.onecDocNumber = result.docNumber || null;
     writeJson('operations.json', all);
@@ -1231,6 +1343,26 @@ async function findContractForCounterparty(counterpartyKey, purposeText, setting
   return { status: 'none' }; // у конфигурации либо нет отдельного справочника договоров, либо название другое
 }
 
+// Ищет статью ДДС в справочнике 1С по точному названию (например,
+// «Аренда» или «Расчёты с поставщиками и подрядчиками») и возвращает её
+// GUID. Нужно, когда категория пришла из текстового правила или ручной
+// правки, а не из уже готового документа в 1С.
+async function findCategoryKeyByName(name, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const candidates = ['Catalog_СтатьиДвиженияДенежныхСредств', 'Catalog_СтатьиДДС'];
+  const filter = encodeURIComponent(`Description eq '${String(name).replace(/'/g, "''")}'`);
+  for (const catalog of candidates) {
+    const url = `${base}/${catalog}?$format=json&$filter=${filter}&$select=Ref_Key&$top=1`;
+    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!response.ok) continue;
+    const data = await response.json().catch(() => null);
+    const item = data && data.value && data.value[0];
+    if (item) return item.Ref_Key;
+  }
+  return null;
+}
+
 async function findHistoricalCategory(counterpartyKey, amount, settings) {
   if (!counterpartyKey) return null;
   const base = settings.baseUrl.replace(/\/+$/, '');
@@ -1322,7 +1454,7 @@ async function createCounterpartyInOnec(op, settings) {
 // раз узнать (через тот же OData: .../Catalog_Организации?$format=json)
 // и вписать в настройки — без них документ не создать.
 // =====================================================================
-async function createDraftInOnec(op, settings) {
+async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount) {
   const base = settings.baseUrl.replace(/\/+$/, ''); // убираем лишний / на конце
   const docType = op.amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
   const endpoint = `${base}/${docType}`;
@@ -1339,11 +1471,17 @@ async function createDraftInOnec(op, settings) {
     Комментарий: op.purpose, // должно совпадать с назначением платежа, как в вашей 1С
   };
 
-  // Если для этого контрагента нашлась статья ДДС / вид операции по прошлым
-  // документам — используем их, чтобы категоризация совпадала с тем, как
-  // вы (или прежний REST-сервис) разносили такие операции раньше.
+  // Статья ДДС: если она пришла из истории 1С — там уже готовый GUID.
+  // Если она текстовая (из ваших правил или ручной правки) — ищем такую
+  // статью по названию в самом справочнике 1С, чтобы подставить настоящий
+  // GUID, а не просто текст.
   if (op.historicalCategoryKey) {
     payload.СтатьяДвиженияДенежныхСредств_Key = op.historicalCategoryKey;
+  } else if (resolvedCategory) {
+    const key = await findCategoryKeyByName(resolvedCategory, settings);
+    if (key) payload.СтатьяДвиженияДенежныхСредств_Key = key;
+    // Если не нашли даже по имени — не страшно: текст статьи уже есть в
+    // комментарии и в интерфейсе, вы сможете проставить её вручную в 1С.
   }
   if (op.historicalOperationKind) {
     payload.ВидОперации = op.historicalOperationKind;
