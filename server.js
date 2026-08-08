@@ -1479,22 +1479,48 @@ async function findHistoricalCategory(counterpartyKey, amount, settings) {
   return { categoryKey, categoryName: '', operationKind: doc.ВидОперации || '' };
 }
 
+// Название поля с БИН/ИИН отличается между конфигурациями 1С. Вместо
+// одного запроса со всеми вариантами сразу (он падает целиком, если хотя
+// бы одного поля нет — «Сегмент пути БИН не найден»), пробуем варианты
+// по очереди и запоминаем то, которое сработало.
+const BIN_FIELD_CANDIDATES = ['ИИН', 'БИН', 'ИНН', 'БИН_ИИН', 'ИИН_БИН', 'ИННЮЛ', 'ИННФЛ', 'КодПоОКПО', 'РегистрационныйНомер'];
+let workingBinField = null; // определяется один раз за время работы сервера
+
 async function findCounterpartyByBin(bin, settings) {
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const filter = encodeURIComponent(`БИН eq '${bin}' or ИИН eq '${bin}' or ИННЮЛ eq '${bin}' or ИННФЛ eq '${bin}'`);
-  const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}`;
 
-  const response = await fetch(url, {
-    headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Поиск контрагента: 1С ответила ${response.status}: ${text.slice(0, 200)}`);
+  async function tryField(field) {
+    const filter = encodeURIComponent(`${field} eq '${bin}'`);
+    const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}&$top=1`;
+    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!response.ok) return { fieldExists: false };
+    const data = await response.json().catch(() => null);
+    if (!data) return { fieldExists: false };
+    return { fieldExists: true, found: (data.value || [])[0] || null };
   }
-  const data = await response.json().catch(() => ({}));
-  const list = data.value || [];
-  return list.length > 0 ? list[0] : null;
+
+  // Если рабочее поле уже определено — сразу используем его.
+  if (workingBinField) {
+    const r = await tryField(workingBinField);
+    if (r.fieldExists) return r.found;
+    workingBinField = null; // поле перестало работать — определим заново
+  }
+
+  const errors = [];
+  for (const field of BIN_FIELD_CANDIDATES) {
+    const r = await tryField(field);
+    if (r.fieldExists) {
+      workingBinField = field; // запомнили — дальше будет быстро
+      if (r.found) return r.found;
+      return null; // поле рабочее, но контрагент с таким БИН не найден
+    }
+    errors.push(field);
+  }
+  throw new Error(
+    `В справочнике контрагентов не нашлось поля с БИН/ИИН. Пробовали: ${errors.join(', ')}. ` +
+    `Откройте в браузере адрес вашей базы + /Catalog_Контрагенты?$format=json&$top=1 и посмотрите, как называется поле с БИН — я добавлю его в список.`
+  );
 }
 
 // Создаёт нового контрагента в справочнике 1С по данным из операции выписки.
@@ -1504,9 +1530,12 @@ async function createCounterpartyInOnec(op, settings) {
 
   const payload = {
     Description: op.counterparty || op.bin,
-    БИН: op.bin,
     Комментарий: 'Создан автоматически · личный кабинет разноски выписок',
   };
+  // Имя поля с БИН/ИИН берём то, которое реально работает в вашей базе
+  // (определяется при первом поиске контрагента). Если ещё не определено —
+  // используем ИИН как самый частый вариант для казахстанских конфигураций.
+  payload[workingBinField || 'ИИН'] = op.bin;
 
   const response = await fetch(`${base}/Catalog_Контрагенты?$format=json`, {
     method: 'POST',
