@@ -175,6 +175,7 @@ const HTML_PAGE = `<!DOCTYPE html>
           <div class="stamp">Черновик</div>
           <p>Подтверждение создаёт документ в 1С без проведения. Проводите сами после проверки.</p>
         </div>
+        <div id="upload-result-banner" class="hidden" style="border:1px solid var(--line);border-radius:var(--radius);padding:12px 16px;margin-bottom:14px;font-size:13px;"></div>
         <div id="review-summary" style="font-size:12.5px;color:var(--muted);margin-bottom:12px;"></div>
         <div id="review-list" class="op-list"><div class="empty">Загрузите файл выписки, чтобы начать</div></div>
       </div>
@@ -228,6 +229,13 @@ const HTML_PAGE = `<!DOCTYPE html>
             <button class="btn btn-primary" onclick="importRules()">Загрузить правила</button>
             <span id="rules-import-msg" style="font-size:12.5px;color:var(--muted);margin-left:10px;"></span>
           </div>
+        </div>
+
+        <div class="settings-card" style="max-width:none;">
+          <div class="settings-title" style="margin-bottom:6px;">Сделать правила постоянными</div>
+          <p style="font-size:12px;color:var(--muted);margin:0 0 10px;">Как и подключение к 1С, правила сбрасываются при каждом обновлении сайта. Нажмите — покажется текст для копирования в Render → Environment → переменная <b>RULES_TEXT</b>.</p>
+          <button class="btn btn-ghost" onclick="exportRules()">Показать текст для Render</button>
+          <textarea id="rules-export-box" rows="4" readonly style="display:none;width:100%;margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:12px;font-family:'IBM Plex Mono',monospace;"></textarea>
         </div>
 
         <div class="table-card"><table>
@@ -602,6 +610,15 @@ async function importRules(){
   }catch(e){ msg.textContent = e.message; }
 }
 
+async function exportRules(){
+  const result = await api('/api/rules/export');
+  const box = document.getElementById('rules-export-box');
+  box.value = result.text;
+  box.style.display = 'block';
+  box.focus();
+  box.select();
+}
+
 async function deleteRule(id){
   await api('/api/rules/'+id, {method:'DELETE'});
   loadRules(); loadOperations();
@@ -611,8 +628,24 @@ async function doUpload(file){
   if(!file) return;
   const fd = new FormData();
   fd.append('file', file);
+  const banner = document.getElementById('upload-result-banner');
+  if(banner){ banner.classList.remove('hidden'); banner.textContent = 'Загружаю и сверяю с 1С — это может занять минуту...'; banner.style.background='var(--paper-2)'; banner.style.color='var(--muted)'; banner.style.borderColor='var(--line)'; }
   const res = await fetch('/api/upload', {method:'POST', credentials:'include', body: fd});
-  if(!res.ok){ const e = await res.json().catch(()=>({})); alert(e.error||'Ошибка загрузки'); return; }
+  if(!res.ok){ const e = await res.json().catch(()=>({})); if(banner) banner.classList.add('hidden'); alert(e.error||'Ошибка загрузки'); return; }
+  const result = await res.json().catch(()=>({}));
+  if(banner && result.reconciliation){
+    const r = result.reconciliation;
+    let text = \`Загружено \${r.total} новых операций\`;
+    if(result.skippedDuplicates) text += \` (пропущено дублей: \${result.skippedDuplicates})\`;
+    if(r.connected){
+      text += \`. Сверка с 1С: уже есть в базе — \${r.alreadyIn1c}, новых контрагентов — \${r.newCounterparty}, к проверке — \${r.total - r.alreadyIn1c}.\`;
+      banner.style.background='var(--green-soft)'; banner.style.color='var(--green-text)'; banner.style.borderColor='var(--green)';
+    } else {
+      text += '. Сверка с 1С НЕ выполнена — подключение не настроено (раздел «Настройки»).';
+      banner.style.background='var(--red-soft)'; banner.style.color='var(--red)'; banner.style.borderColor='var(--red)';
+    }
+    banner.textContent = text;
+  }
   loadOperations(); loadHistory();
 }
 
@@ -696,6 +729,34 @@ if (!fs.existsSync(path.join(DATA_DIR, 'rules.json'))) {
   }
   if (changed) writeJson('rules.json', existing);
 }
+
+// Если задана переменная окружения RULES_TEXT (тот же формат, что и в
+// массовой загрузке: "текст | статья | счёт | поле" построчно) — и в
+// файле правил сейчас только типовые правила по умолчанию (то есть
+// после пересборки ваши личные правила ещё не восстановлены) —
+// восстанавливаем их из переменной окружения. Так правила переживают
+// пересборку сайта так же, как и подключение к 1С.
+if (process.env.RULES_TEXT) {
+  const current = readJson('rules.json', []);
+  const looksLikeOnlyDefaults = current.length <= DEFAULT_RULES.length;
+  if (looksLikeOnlyDefaults) {
+    const lines = process.env.RULES_TEXT.split('\n').map(l => l.trim()).filter(Boolean);
+    const restored = [];
+    for (const line of lines) {
+      const parts = line.split('|').map(p => p.trim());
+      if (parts.length < 2) continue;
+      const [contains, category, account, fieldRaw] = parts;
+      if (!category && !account) continue;
+      restored.push({
+        id: crypto.randomUUID(),
+        field: fieldRaw === 'counterparty' ? 'counterparty' : 'purpose',
+        contains, category: category || '', account: account || '',
+      });
+    }
+    if (restored.length) writeJson('rules.json', restored);
+  }
+}
+
 
 // Базовые счета по регламенту — работают ВСЕГДА, когда более точное правило
 // (историческое или из «Правил») не найдено. Счёт указывается парой —
@@ -1084,7 +1145,18 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
     writeJson('operations.json', updated);
   }
 
-  res.json({ operations: newOnly, skippedDuplicates });
+  const reconciliation = {
+    total: newOnly.length,
+    alreadyIn1c: newOnly.filter(o => updated.find(u => u.id === o.id)?.status === 'already_in_1c').length,
+    newCounterparty: newOnly.filter(o => updated.find(u => u.id === o.id)?.status === 'new_counterparty').length,
+    connected: !!(settingsForMatch.baseUrl && settingsForMatch.login),
+  };
+  addHistory(
+    `Сверка с 1С: из ${reconciliation.total} операций — уже в 1С: ${reconciliation.alreadyIn1c}, новых контрагентов: ${reconciliation.newCounterparty}`,
+    '—'
+  );
+
+  res.json({ operations: newOnly, skippedDuplicates, reconciliation });
 });
 
 // ---------- список операций на проверку ----------
@@ -1288,6 +1360,15 @@ app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res
 // ---------- правила категоризации (редактируются прямо в кабинете) ----------
 app.get('/api/rules', requireAuth, (req, res) => {
   res.json(readJson('rules.json', []));
+});
+
+// Отдаёт правила текстом в том же формате, что и массовая загрузка —
+// чтобы вставить в Render → Environment → RULES_TEXT и не терять их
+// при следующей пересборке сайта.
+app.get('/api/rules/export', requireAuth, (req, res) => {
+  const rules = readJson('rules.json', []);
+  const text = rules.map(r => `${r.contains} | ${r.category} | ${r.account}${r.field === 'counterparty' ? ' | counterparty' : ''}`).join('\n');
+  res.json({ text });
 });
 
 app.post('/api/rules', requireAuth, (req, res) => {
