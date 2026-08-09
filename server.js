@@ -498,11 +498,11 @@ async function loadOperations(){
             <input class="edit-input mono" id="acc-\${o.id}" value="\${(o.suggestedAccount||'').replace(/"/g,'&quot;')}" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;">
           </div>
           <div class="op-detail-item">
-            <label>Вид операции</label>
+            <label>Вид операции (только из истории 1С)</label>
             <input class="edit-input" id="opkind-\${o.id}" value="\${(o.suggestedOperationKind||'').replace(/"/g,'&quot;')}" placeholder="например: Перечисление денежных средств подотчетнику" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;">
           </div>
           <div class="op-detail-item">
-            <label>Вид задолженности</label>
+            <label>Вид задолженности (только из истории 1С)</label>
             <input class="edit-input" id="debttype-\${o.id}" value="\${(o.suggestedDebtType||'').replace(/"/g,'&quot;')}" placeholder="например: Оплата поставщикам" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;">
           </div>
           <div class="op-detail-item"><label>Договор</label><div>\${contractText}</div></div>
@@ -1728,8 +1728,16 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
     // комментарии и в интерфейсе, вы сможете проставить её вручную в 1С.
   }
   if (categoryKey) payload.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
-  if (resolvedOperationKind) {
-    payload.ВидОперации = resolvedOperationKind;
+
+  // ВАЖНО: "Вид операции" — это не текстовое поле, а строгий список
+  // (перечисление) в 1С. Туда можно передать только значение, которое там
+  // реально существует, иначе 1С отвечает ошибкой вида "Перечисление ...
+  // не содержит элемент '...'". Свободный текст из правил/ручной правки
+  // сюда НЕ отправляем — только значение, скопированное из уже
+  // существующего документа в истории (оно гарантированно валидно, так
+  // как пришло из самой 1С).
+  if (op.historicalOperationKind) {
+    payload.ВидОперации = op.historicalOperationKind;
   }
 
   // Договор — привязываем, только если найден однозначно. Если у
@@ -1762,7 +1770,9 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   };
   if (op.contractKey) lineItem.Договор_Key = op.contractKey;
   if (categoryKey) lineItem.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
-  if (resolvedDebtType) lineItem.ВидЗадолженности = resolvedDebtType;
+  // Тот же принцип, что и с "Видом операции" — "Вид задолженности" тоже
+  // строгий список, свободный текст туда передавать нельзя.
+  if (op.historicalDebtType) lineItem.ВидЗадолженности = op.historicalDebtType;
   payload.РасшифровкаПлатежа = [lineItem];
 
   if (!op.counterpartyKey) {
