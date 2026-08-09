@@ -497,6 +497,14 @@ async function loadOperations(){
             <label>Счёт</label>
             <input class="edit-input mono" id="acc-\${o.id}" value="\${(o.suggestedAccount||'').replace(/"/g,'&quot;')}" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;">
           </div>
+          <div class="op-detail-item">
+            <label>Вид операции</label>
+            <input class="edit-input" id="opkind-\${o.id}" value="\${(o.suggestedOperationKind||'').replace(/"/g,'&quot;')}" placeholder="например: Перечисление денежных средств подотчетнику" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;">
+          </div>
+          <div class="op-detail-item">
+            <label>Вид задолженности</label>
+            <input class="edit-input" id="debttype-\${o.id}" value="\${(o.suggestedDebtType||'').replace(/"/g,'&quot;')}" placeholder="например: Оплата поставщикам" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;">
+          </div>
           <div class="op-detail-item"><label>Договор</label><div>\${contractText}</div></div>
           <div class="op-detail-item"><label>КНП</label><div class="mono">\${o.knp || '—'}</div></div>
           <div class="op-detail-item op-detail-full"><label>Полное назначение платежа</label><div>\${o.purpose}</div></div>
@@ -504,8 +512,14 @@ async function loadOperations(){
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px;">
           <button class="btn btn-ghost" style="padding:7px 12px;font-size:12.5px;" onclick="event.stopPropagation();saveOverride('\${o.id}', false)">Сохранить правку</button>
           <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer;">
-            <input type="checkbox" id="rule-\${o.id}"> запомнить как правило для похожих операций
+            <input type="checkbox" id="rule-\${o.id}"> запомнить как правило: если
           </label>
+          <select id="rule-field-\${o.id}" style="padding:4px 6px;border:1px solid var(--line);border-radius:6px;font-size:12px;">
+            <option value="counterparty" selected>контрагент</option>
+            <option value="purpose">назначение</option>
+          </select>
+          <span style="font-size:12.5px;color:var(--muted);">содержит</span>
+          <input id="rule-contains-\${o.id}" value="\${(o.counterparty||'').replace(/"/g,'&quot;')}" style="padding:4px 8px;border:1px solid var(--line);border-radius:6px;font-size:12px;width:180px;">
           <span id="override-msg-\${o.id}" style="font-size:12px;color:var(--muted);"></span>
         </div>
       </div>
@@ -517,16 +531,18 @@ async function loadOperations(){
 async function saveOverride(id, silent){
   const category = document.getElementById('cat-'+id).value.trim();
   const account = document.getElementById('acc-'+id).value.trim();
+  const operationKind = document.getElementById('opkind-'+id).value.trim();
+  const debtType = document.getElementById('debttype-'+id).value.trim();
   const rememberBox = document.getElementById('rule-'+id);
   const remember = rememberBox && rememberBox.checked;
   const msg = document.getElementById('override-msg-'+id);
-  const body = { category, account };
+  const body = { category, account, operationKind, debtType };
   if(remember){
-    // Простое ключевое слово для правила — берём то, что вы ввели как статью,
-    // это надёжнее, чем гадать по всему тексту назначения платежа.
+    const fieldSel = document.getElementById('rule-field-'+id);
+    const containsInput = document.getElementById('rule-contains-'+id);
     body.saveAsRule = true;
-    body.ruleContains = category;
-    body.ruleField = 'purpose';
+    body.ruleField = fieldSel ? fieldSel.value : 'purpose';
+    body.ruleContains = containsInput ? containsInput.value.trim() : category;
   }
   try{
     const result = await api('/api/operations/'+id+'/override', {method:'POST', body: JSON.stringify(body)});
@@ -815,11 +831,17 @@ function applyRules(op, rules) {
   for (const rule of rules) {
     const haystack = (rule.field === 'counterparty' ? op.counterparty : op.purpose) || '';
     if (haystack.toLowerCase().includes(String(rule.contains || '').toLowerCase())) {
-      return { category: rule.category || '', account: rule.account || '', source: 'rule' };
+      return {
+        category: rule.category || '',
+        account: rule.account || '',
+        operationKind: rule.operationKind || '',
+        debtType: rule.debtType || '',
+        source: 'rule',
+      };
     }
   }
   const base = baseDefault(op.amount);
-  return { ...base, source: 'default' };
+  return { ...base, operationKind: '', debtType: '', source: 'default' };
 }
 
 // ---------- вход по паролю (сессия в памяти сервера) ----------
@@ -1115,6 +1137,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
               target.historicalCategory = historical.categoryName || '';
               target.historicalCategoryKey = historical.categoryKey || '';
               target.historicalOperationKind = historical.operationKind || '';
+              target.historicalDebtType = historical.debtType || '';
             }
           } catch (e) {
             // Не критично — просто не будет автопредложения по истории для этой операции.
@@ -1172,11 +1195,15 @@ app.get('/api/operations', requireAuth, (req, res) => {
     const ruleMatch = applyRules(op, rules);
     const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
     const account = op.manualAccount || op.historicalAccount || ruleMatch.account;
+    const operationKind = op.manualOperationKind || op.historicalOperationKind || ruleMatch.operationKind;
+    const debtType = op.manualDebtType || op.historicalDebtType || ruleMatch.debtType;
     const isDefaultOnly = !op.manualCategory && !op.historicalCategory && ruleMatch.source === 'default';
     return {
       ...op,
       suggestedCategory: category,
       suggestedAccount: account,
+      suggestedOperationKind: operationKind,
+      suggestedDebtType: debtType,
       isDefaultOnly, // категория определена только базовой логикой, стоит перепроверить глазами
       needsAttention: !category,
     };
@@ -1195,10 +1222,12 @@ app.post('/api/operations/:id/override', requireAuth, (req, res) => {
   const op = all.find(o => o.id === req.params.id);
   if (!op) return res.status(404).json({ error: 'Операция не найдена' });
 
-  const { category, account, contractKey, contractName, saveAsRule, ruleContains, ruleField } = req.body;
+  const { category, account, operationKind, debtType, contractKey, contractName, saveAsRule, ruleContains, ruleField } = req.body;
 
   if (category !== undefined) op.manualCategory = String(category || '');
   if (account !== undefined) op.manualAccount = String(account || '');
+  if (operationKind !== undefined) op.manualOperationKind = String(operationKind || '');
+  if (debtType !== undefined) op.manualDebtType = String(debtType || '');
   if (contractKey !== undefined) {
     op.contractKey = contractKey || null;
     op.contractName = contractName || '';
@@ -1207,7 +1236,7 @@ app.post('/api/operations/:id/override', requireAuth, (req, res) => {
   writeJson('operations.json', all);
 
   let ruleAdded = false;
-  if (saveAsRule && ruleContains && (category || account)) {
+  if (saveAsRule && ruleContains && (category || account || operationKind || debtType)) {
     const rules = readJson('rules.json', []);
     rules.unshift({
       id: crypto.randomUUID(),
@@ -1215,6 +1244,8 @@ app.post('/api/operations/:id/override', requireAuth, (req, res) => {
       contains: String(ruleContains),
       category: String(category || ''),
       account: String(account || ''),
+      operationKind: String(operationKind || ''),
+      debtType: String(debtType || ''),
     });
     writeJson('rules.json', rules);
     ruleAdded = true;
@@ -1244,12 +1275,14 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
   const ruleMatch = applyRules(op, rules);
   const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
   const account = op.manualAccount || op.historicalAccount || ruleMatch.account;
+  const operationKind = op.manualOperationKind || op.historicalOperationKind || ruleMatch.operationKind;
+  const debtType = op.manualDebtType || op.historicalDebtType || ruleMatch.debtType;
   if (!category) {
     return res.status(400).json({ error: 'Не определена статья ДДС — поправьте вручную в карточке операции, прежде чем подтверждать.' });
   }
 
   try {
-    const result = await createDraftInOnec(op, settings, category, account);
+    const result = await createDraftInOnec(op, settings, category, account, operationKind, debtType);
     op.status = 'draft_created';
     op.onecDocNumber = result.docNumber || null;
     writeJson('operations.json', all);
@@ -1546,17 +1579,23 @@ async function findHistoricalCategory(counterpartyKey, amount, settings) {
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
   const docType = amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
 
+  // Статья ДДС в реальности лежит ВНУТРИ табличной части "РасшифровкаПлатежа",
+  // а не на уровне самого документа — поэтому обязательно разворачиваем её
+  // через $expand, иначе эти поля просто не приедут в ответе.
   const filter = encodeURIComponent(`Контрагент_Key eq guid'${counterpartyKey}'`);
-  const url = `${base}/${docType}?$format=json&$filter=${filter}&$orderby=Date desc&$top=1&$select=СтатьяДвиженияДенежныхСредств_Key,ВидОперации`;
+  const url = `${base}/${docType}?$format=json&$filter=${filter}&$orderby=Date desc&$top=1&$expand=РасшифровкаПлатежа`;
 
   const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
   if (!response.ok) return null;
   const data = await response.json().catch(() => null);
   const doc = data && data.value && data.value[0];
-  if (!doc || !doc.СтатьяДвиженияДенежныхСредств_Key) return null;
+  const row = doc && doc.РасшифровкаПлатежа && doc.РасшифровкаПлатежа[0];
+  const categoryKey = row && row.СтатьяДвиженияДенежныхСредств_Key;
+  if (!doc || !categoryKey) return null;
+
+  const debtType = (row && (row.ВидЗадолженности || row.ВидЗадолженности_Key)) || '';
 
   // Статья хранится как GUID — подтягиваем её человекочитаемое название
-  const categoryKey = doc.СтатьяДвиженияДенежныхСредств_Key;
   const categoryCatalogs = ['Catalog_СтатьиДвиженияДенежныхСредств', 'Catalog_СтатьиДДС'];
   for (const catalog of categoryCatalogs) {
     const catUrl = `${base}/${catalog}(guid'${categoryKey}')?$format=json&$select=Description`;
@@ -1564,7 +1603,7 @@ async function findHistoricalCategory(counterpartyKey, amount, settings) {
     if (catResp.ok) {
       const catData = await catResp.json().catch(() => null);
       if (catData && catData.Description) {
-        return { categoryKey, categoryName: catData.Description, operationKind: doc.ВидОперации || '' };
+        return { categoryKey, categoryName: catData.Description, operationKind: doc.ВидОперации || '', debtType };
       }
     }
   }
@@ -1660,7 +1699,7 @@ async function createCounterpartyInOnec(op, settings) {
 // раз узнать (через тот же OData: .../Catalog_Организации?$format=json)
 // и вписать в настройки — без них документ не создать.
 // =====================================================================
-async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount) {
+async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount, resolvedOperationKind, resolvedDebtType) {
   const base = settings.baseUrl.replace(/\/+$/, ''); // убираем лишний / на конце
   const docType = op.amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
   const endpoint = `${base}/${docType}`;
@@ -1677,19 +1716,20 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
     Комментарий: op.purpose, // должно совпадать с назначением платежа, как в вашей 1С
   };
 
-  // Статья ДДС: если она пришла из истории 1С — там уже готовый GUID.
-  // Если она текстовая (из ваших правил или ручной правки) — ищем такую
-  // статью по названию в самом справочнике 1С, чтобы подставить настоящий
-  // GUID, а не просто текст.
-  let categoryKey = op.historicalCategoryKey || null;
-  if (!categoryKey && resolvedCategory) {
+  // Статья ДДС: если вы её НЕ правили руками и в истории 1С уже есть
+  // готовый GUID — используем его напрямую. Иначе (ручная правка, правило,
+  // или текст без готового GUID) ищем статью по названию в справочнике.
+  let categoryKey = null;
+  if (!op.manualCategory && op.historicalCategoryKey) {
+    categoryKey = op.historicalCategoryKey;
+  } else if (resolvedCategory) {
     categoryKey = await findCategoryKeyByName(resolvedCategory, settings);
     // Если не нашли даже по имени — не страшно: текст статьи уже есть в
     // комментарии и в интерфейсе, вы сможете проставить её вручную в 1С.
   }
   if (categoryKey) payload.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
-  if (op.historicalOperationKind) {
-    payload.ВидОперации = op.historicalOperationKind;
+  if (resolvedOperationKind) {
+    payload.ВидОперации = resolvedOperationKind;
   }
 
   // Договор — привязываем, только если найден однозначно. Если у
@@ -1707,15 +1747,23 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   // "Расшифровка платежа" (видна как таблица внутри документа в 1С).
   // Без нее табличная часть остаётся пустой строкой, даже если общая
   // сумма наверху документа заполнена правильно.
+  //
+  // ВАЖНО №2: если GUID-поле (Договор_Key, СтатьяДвиженияДенежныхСредств_Key)
+  // неизвестно — его нужно просто НЕ включать в объект, а не отправлять
+  // пустую строку. 1С понимает "поля нет" нормально, а вот пустую строку
+  // вместо GUID отвергает ошибкой "Не удалось разобрать строку '' как
+  // значение типа Edm.Guid".
   const amountAbs = Math.abs(op.amount);
-  payload.РасшифровкаПлатежа = [{
+  const lineItem = {
     LineNumber: 1,
-    Договор_Key: op.contractKey || '',
     СуммаПлатежа: amountAbs,
     КурсВзаиморасчетов: 1,
     СуммаВзаиморасчетов: amountAbs,
-    СтатьяДвиженияДенежныхСредств_Key: categoryKey || '',
-  }];
+  };
+  if (op.contractKey) lineItem.Договор_Key = op.contractKey;
+  if (categoryKey) lineItem.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
+  if (resolvedDebtType) lineItem.ВидЗадолженности = resolvedDebtType;
+  payload.РасшифровкаПлатежа = [lineItem];
 
   if (!op.counterpartyKey) {
     throw new Error('Контрагент не сопоставлен со справочником 1С — сначала выберите контрагента вручную');
