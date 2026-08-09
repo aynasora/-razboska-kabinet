@@ -821,6 +821,20 @@ if (!fs.existsSync(path.join(DATA_DIR, 'settings.json'))) {
   if (!current.baseUrl) writeJson('settings.json', envSettings);
 }
 
+// Некоторые латинские и кириллические буквы визуально неотличимы (a/а,
+// e/е, o/о, p/р, c/с, x/х, y/у, k/к, h/н, m/м, t/т, b/в и т.д.). Если при
+// вводе текста (в правиле или в самой банковской выписке) закралась "не
+// та" буква — обычное сравнение строк не находит совпадение, хотя
+// глазами всё выглядит одинаково. Эта функция приводит все похожие
+// буквы к одному (кириллическому) варианту перед сравнением.
+const SCRIPT_NORMALIZE_MAP = {
+  a: 'а', e: 'е', o: 'о', p: 'р', c: 'с', x: 'х', y: 'у', k: 'к', h: 'н', m: 'м', t: 'т', b: 'в', i: 'і',
+  A: 'А', E: 'Е', O: 'О', P: 'Р', C: 'С', X: 'Х', Y: 'У', K: 'К', H: 'Н', M: 'М', T: 'Т', B: 'В', I: 'І',
+};
+function normalizeScript(s) {
+  return String(s || '').split('').map(ch => SCRIPT_NORMALIZE_MAP[ch] || ch).join('');
+}
+
 // Применяет ваши правила категоризации к операции: смотрит назначение
 // платежа и/или имя контрагента, и если находит совпадение — возвращает
 // категорию и счёт. Правила проверяются по порядку, первое совпадение
@@ -829,8 +843,10 @@ if (!fs.existsSync(path.join(DATA_DIR, 'settings.json'))) {
 // направлению платежа должна быть определена всегда.
 function applyRules(op, rules) {
   for (const rule of rules) {
-    const haystack = (rule.field === 'counterparty' ? op.counterparty : op.purpose) || '';
-    if (haystack.toLowerCase().includes(String(rule.contains || '').toLowerCase())) {
+    const raw = (rule.field === 'counterparty' ? op.counterparty : op.purpose) || '';
+    const haystack = normalizeScript(raw).toLowerCase();
+    const needle = normalizeScript(String(rule.contains || '')).toLowerCase();
+    if (needle && haystack.includes(needle)) {
       return {
         category: rule.category || '',
         account: rule.account || '',
@@ -1043,7 +1059,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
         id: crypto.randomUUID(),
         date: dateRaw.split(' ')[0] || dateRaw,
         counterparty: cols.counterparty !== -1 ? String(row[cols.counterparty] || '') : '',
-        bin: String(bin || ''),
+        bin: String(bin || '').trim(),
         purpose: cols.purpose !== -1 ? String(row[cols.purpose] || '') : '',
         knp: cols.knp !== -1 ? String(row[cols.knp] || '') : '', // код назначения платежа — берём прямо из выписки банка
         amount,
@@ -1124,7 +1140,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
 
       if (!op.bin) continue;
       try {
-        const found = await findCounterpartyByBin(op.bin, settingsForMatch);
+        const found = await findCounterpartyByBin(op.bin, settingsForMatch, op.counterparty);
         if (found) {
           target.counterpartyKey = found.Ref_Key;
           target.counterpartyMatchedName = found.Description || '';
@@ -1318,7 +1334,7 @@ app.post('/api/operations/:id/rematch', requireAuth, async (req, res) => {
     }
 
     if (op.bin) {
-      const found = await findCounterpartyByBin(op.bin, settings);
+      const found = await findCounterpartyByBin(op.bin, settings, op.counterparty);
       if (found) {
         op.counterpartyKey = found.Ref_Key;
         op.counterpartyMatchedName = found.Description || '';
@@ -1367,7 +1383,7 @@ app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res
   try {
     // На всякий случай проверяем ещё раз прямо перед созданием — вдруг
     // контрагент уже появился в 1С (например, кто-то создал его вручную).
-    const existing = await findCounterpartyByBin(op.bin, settings);
+    const existing = await findCounterpartyByBin(op.bin, settings, op.counterparty);
     let key, name;
     if (existing) {
       key = existing.Ref_Key;
@@ -1617,7 +1633,7 @@ async function findHistoricalCategory(counterpartyKey, amount, settings) {
 const BIN_FIELD_CANDIDATES = ['ИИН', 'БИН', 'ИНН', 'БИН_ИИН', 'ИИН_БИН', 'ИННЮЛ', 'ИННФЛ', 'КодПоОКПО', 'РегистрационныйНомер'];
 let workingBinField = null; // определяется один раз за время работы сервера
 
-async function findCounterpartyByBin(bin, settings) {
+async function findCounterpartyByBin(bin, settings, name) {
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
 
@@ -1631,12 +1647,32 @@ async function findCounterpartyByBin(bin, settings) {
     return { fieldExists: true, found: (data.value || [])[0] || null };
   }
 
+  // Запасной поиск по названию — на случай, если БИН в выписке не
+  // считался или не совпал по формату, а контрагент в справочнике
+  // на самом деле есть (просто под этим именем). Ищем частичное
+  // совпадение по названию, без учёта регистра.
+  async function tryByName() {
+    if (!name || name.trim().length < 3) return null;
+    const cleanName = name.trim().replace(/'/g, "''");
+    const filter = encodeURIComponent(`substringof('${cleanName}', Description)`);
+    const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}&$top=1`;
+    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!response.ok) return null;
+    const data = await response.json().catch(() => null);
+    return (data && data.value && data.value[0]) || null;
+  }
+
   // Если рабочее поле уже определено — сразу используем его.
-  if (workingBinField) {
+  if (workingBinField && bin) {
     const r = await tryField(workingBinField);
-    if (r.fieldExists) return r.found;
+    if (r.fieldExists) {
+      if (r.found) return r.found;
+      return await tryByName(); // БИН не совпал — пробуем по названию
+    }
     workingBinField = null; // поле перестало работать — определим заново
   }
+
+  if (!bin) return await tryByName(); // БИН в выписке пуст — сразу по названию
 
   const errors = [];
   for (const field of BIN_FIELD_CANDIDATES) {
@@ -1644,10 +1680,14 @@ async function findCounterpartyByBin(bin, settings) {
     if (r.fieldExists) {
       workingBinField = field; // запомнили — дальше будет быстро
       if (r.found) return r.found;
-      return null; // поле рабочее, но контрагент с таким БИН не найден
+      return await tryByName(); // поле рабочее, но по БИН не нашли — пробуем по названию
     }
     errors.push(field);
   }
+  // Ни одно поле с БИН не сработало вообще — прежде чем сдаться, всё
+  // равно пробуем по названию.
+  const byName = await tryByName();
+  if (byName) return byName;
   throw new Error(
     `В справочнике контрагентов не нашлось поля с БИН/ИИН. Пробовали: ${errors.join(', ')}. ` +
     `Откройте в браузере адрес вашей базы + /Catalog_Контрагенты?$format=json&$top=1 и посмотрите, как называется поле с БИН — я добавлю его в список.`
