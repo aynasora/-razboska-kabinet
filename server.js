@@ -445,7 +445,8 @@ async function loadOperations(){
     // но статус остался обычным "review". Без реального Ref_Key
     // контрагента документ в 1С создать нельзя — блокируем и предлагаем
     // пересверить.
-    const missingCounterparty = !done && !already && !isNew && !o.counterpartyKey;
+    const missingCounterparty = !done && !already && !isNew && !o.counterpartyKey && o.status !== 'ambiguous_counterparty';
+    const ambiguousCounterparty = o.status === 'ambiguous_counterparty';
     let statusHtml, actionHtml;
     if(done){
       statusHtml = '<span class="pill pill-approved">Черновик создан</span>';
@@ -456,6 +457,9 @@ async function loadOperations(){
     } else if(isNew){
       statusHtml = '<span class="pill pill-new">Новый контрагент</span>';
       actionHtml = '<button class="icon-btn" onclick="event.stopPropagation();createCounterparty(\\''+o.id+'\\')">Создать контрагента</button>';
+    } else if(ambiguousCounterparty){
+      statusHtml = '<span class="pill pill-new">Несколько контрагентов — выбрать</span>';
+      actionHtml = '<span style="font-size:11px;color:var(--muted);">выберите ниже ↓</span>';
     } else if(missingCounterparty){
       statusHtml = '<span class="pill pill-new">Контрагент не сверен</span>';
       actionHtml = '<button class="icon-btn" onclick="event.stopPropagation();rematchOp(\\''+o.id+'\\')">Пересверить с 1С</button>';
@@ -488,6 +492,15 @@ async function loadOperations(){
         <div class="op-chevron">▾</div>
       </div>
       <div class="op-details">
+        \${ambiguousCounterparty ? \`
+        <div style="background:var(--red-soft);border:1px solid var(--red);border-radius:8px;padding:12px 14px;margin-bottom:14px;">
+          <div style="font-size:12.5px;color:var(--red);margin-bottom:8px;">В справочнике нашлось несколько контрагентов с похожим именем — выберите нужного:</div>
+          <select id="cp-choice-\${o.id}" style="width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;font-size:13px;margin-bottom:8px;">
+            \${(o.counterpartyOptions||[]).map(c => \`<option value="\${c.key}">\${c.name}</option>\`).join('')}
+          </select>
+          <button class="btn btn-primary" style="padding:7px 12px;font-size:12.5px;" onclick="event.stopPropagation();chooseCounterparty('\${o.id}')">Выбрать этого контрагента</button>
+        </div>
+        \` : ''}
         <div class="op-detail-grid">
           <div class="op-detail-item">
             <label>Статья ДДС\${defaultHint}</label>
@@ -576,6 +589,17 @@ async function createCounterparty(id){
 async function rematchOp(id){
   try{
     await api('/api/operations/'+id+'/rematch', {method:'POST'});
+    loadOperations(); loadHistory();
+  }catch(e){ alert(e.message); }
+}
+
+async function chooseCounterparty(id){
+  const select = document.getElementById('cp-choice-'+id);
+  if(!select) return;
+  const key = select.value;
+  const name = select.options[select.selectedIndex].text;
+  try{
+    await api('/api/operations/'+id+'/choose-counterparty', {method:'POST', body: JSON.stringify({counterpartyKey: key, counterpartyName: name})});
     loadOperations(); loadHistory();
   }catch(e){ alert(e.message); }
 }
@@ -1138,7 +1162,6 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
         // Если сверка не удалась — не блокируем, просто идём дальше как обычно.
       }
 
-      if (!op.bin) continue;
       try {
         const found = await findCounterpartyByBin(op.bin, settingsForMatch, op.counterparty);
         if (found) {
@@ -1148,7 +1171,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
           // Смотрим, как этот контрагент категоризировался раньше в 1С —
           // если найдём паттерн, используем ту же статью ДДС автоматически.
           try {
-            const historical = await findHistoricalCategory(found.Ref_Key, op.amount, settingsForMatch);
+            const historical = await findHistoricalCategory(found.Ref_Key, op.amount, settingsForMatch, op.purpose);
             if (historical) {
               target.historicalCategory = historical.categoryName || '';
               target.historicalCategoryKey = historical.categoryKey || '';
@@ -1177,8 +1200,12 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
           target.status = 'new_counterparty';
         }
       } catch (e) {
-        // Если проверка не удалась (например, неверный пароль) — не блокируем
-        // загрузку, просто оставляем операцию как есть, на проверке.
+        if (e.ambiguousCounterparty) {
+          target.status = 'ambiguous_counterparty';
+          target.counterpartyOptions = e.ambiguousCounterparty.map(o => ({ key: o.Ref_Key, name: o.Description }));
+        }
+        // Иначе — проверка не удалась (например, неверный пароль) — не
+        // блокируем загрузку, просто оставляем операцию как есть, на проверке.
       }
     }
     writeJson('operations.json', updated);
@@ -1315,6 +1342,48 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
 // Нужно, когда операция была загружена до того, как подключение к 1С
 // было настроено (или сверка не удалась) — прогоняем ту же логику,
 // что и при первой загрузке, но для одной конкретной операции.
+// ---------- выбрать контрагента вручную из неоднозначных вариантов ----------
+app.post('/api/operations/:id/choose-counterparty', requireAuth, async (req, res) => {
+  const all = readJson('operations.json', []);
+  const op = all.find(o => o.id === req.params.id);
+  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
+
+  const { counterpartyKey, counterpartyName } = req.body;
+  if (!counterpartyKey) return res.status(400).json({ error: 'Не выбран контрагент' });
+
+  op.counterpartyKey = counterpartyKey;
+  op.counterpartyMatchedName = counterpartyName || '';
+  op.status = 'review';
+  op.counterpartyOptions = undefined;
+
+  const settings = readJson('settings.json', {});
+  if (settings.baseUrl) {
+    try {
+      const historical = await findHistoricalCategory(counterpartyKey, op.amount, settings, op.purpose);
+      if (historical) {
+        op.historicalCategory = historical.categoryName || '';
+        op.historicalCategoryKey = historical.categoryKey || '';
+        op.historicalOperationKind = historical.operationKind || '';
+        op.historicalDebtType = historical.debtType || '';
+      }
+      const contract = await findContractForCounterparty(counterpartyKey, op.purpose, settings);
+      if (contract) {
+        op.contractStatus = contract.status;
+        if (contract.status === 'matched') {
+          op.contractKey = contract.key;
+          op.contractName = contract.name;
+        }
+      }
+    } catch (e) {
+      // Не критично — просто без истории/договора для этой операции.
+    }
+  }
+
+  writeJson('operations.json', all);
+  addHistory(`Контрагент выбран вручную: ${counterpartyName}`, '—');
+  res.json({ ok: true, op });
+});
+
 app.post('/api/operations/:id/rematch', requireAuth, async (req, res) => {
   const all = readJson('operations.json', []);
   const op = all.find(o => o.id === req.params.id);
@@ -1340,7 +1409,7 @@ app.post('/api/operations/:id/rematch', requireAuth, async (req, res) => {
         op.counterpartyMatchedName = found.Description || '';
         op.status = 'review';
 
-        const historical = await findHistoricalCategory(found.Ref_Key, op.amount, settings).catch(() => null);
+        const historical = await findHistoricalCategory(found.Ref_Key, op.amount, settings, op.purpose).catch(() => null);
         if (historical) {
           op.historicalCategory = historical.categoryName || '';
           op.historicalCategoryKey = historical.categoryKey || '';
@@ -1589,7 +1658,7 @@ async function findCategoryKeyByName(name, settings) {
   return null;
 }
 
-async function findHistoricalCategory(counterpartyKey, amount, settings) {
+async function findHistoricalCategory(counterpartyKey, amount, settings, currentPurpose) {
   if (!counterpartyKey) return null;
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
@@ -1598,15 +1667,53 @@ async function findHistoricalCategory(counterpartyKey, amount, settings) {
   // Статья ДДС в реальности лежит ВНУТРИ табличной части "РасшифровкаПлатежа",
   // а не на уровне самого документа — поэтому обязательно разворачиваем её
   // через $expand, иначе эти поля просто не приедут в ответе.
+  //
+  // Смотрим НЕСКОЛЬКО последних документов (не только самый свежий), потому
+  // что у одного контрагента может быть несколько РАЗНЫХ типов операций
+  // (например, разные виды переводов) — берём не просто "любой заполненный",
+  // а тот, чьё назначение платежа больше всего похоже на текущую операцию.
   const filter = encodeURIComponent(`Контрагент_Key eq guid'${counterpartyKey}'`);
-  const url = `${base}/${docType}?$format=json&$filter=${filter}&$orderby=Date desc&$top=1&$expand=РасшифровкаПлатежа`;
+  const url = `${base}/${docType}?$format=json&$filter=${filter}&$orderby=Date desc&$top=15&$expand=РасшифровкаПлатежа`;
 
   const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
   if (!response.ok) return null;
   const data = await response.json().catch(() => null);
-  const doc = data && data.value && data.value[0];
-  const row = doc && doc.РасшифровкаПлатежа && doc.РасшифровкаПлатежа[0];
-  const categoryKey = row && row.СтатьяДвиженияДенежныхСредств_Key;
+  const docs = (data && data.value) || [];
+
+  // Похожесть текста назначения платежа: доля общих слов (без учёта
+  // регистра), длиной от 3 букв — так короткие союзы/предлоги не мешают.
+  function wordSet(text) {
+    return new Set(String(text || '').toLowerCase().match(/[а-яёіңғүұқөһa-z]{3,}/g) || []);
+  }
+  const currentWords = wordSet(currentPurpose);
+  function similarity(otherText) {
+    if (!currentWords.size) return 0;
+    const otherWords = wordSet(otherText);
+    if (!otherWords.size) return 0;
+    let common = 0;
+    for (const w of currentWords) if (otherWords.has(w)) common++;
+    return common / currentWords.size;
+  }
+
+  // Собираем всех кандидатов, у кого есть хотя бы статья ДДС, и сортируем
+  // по похожести назначения платежа (лучшее совпадение — первым). При
+  // равной похожести побеждает наличие ещё и заполненного вида операции.
+  const candidates = [];
+  for (const candidate of docs) {
+    const candidateRow = candidate.РасшифровкаПлатежа && candidate.РасшифровкаПлатежа[0];
+    const candidateCategoryKey = candidateRow && candidateRow.СтатьяДвиженияДенежныхСредств_Key;
+    if (!candidateCategoryKey) continue;
+    candidates.push({
+      doc: candidate,
+      row: candidateRow,
+      categoryKey: candidateCategoryKey,
+      score: similarity(candidate.НазначениеПлатежа || candidate.Комментарий) + (candidate.ВидОперации ? 0.01 : 0),
+    });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  if (!best) return null;
+  const { doc, row, categoryKey } = best;
   if (!doc || !categoryKey) return null;
 
   const debtType = (row && (row.ВидЗадолженности || row.ВидЗадолженности_Key)) || '';
@@ -1648,18 +1755,54 @@ async function findCounterpartyByBin(bin, settings, name) {
   }
 
   // Запасной поиск по названию — на случай, если БИН в выписке не
-  // считался или не совпал по формату, а контрагент в справочнике
-  // на самом деле есть (просто под этим именем). Ищем частичное
-  // совпадение по названию, без учёта регистра.
+  // считался или не совпал по формату, а контрагент в справочнике на
+  // самом деле есть. ВАЖНО: раньше здесь брался первый попавшийся
+  // результат ($top=1) — если в справочнике несколько похожих записей,
+  // легко было тихо выбрать не того контрагента. Теперь: сначала пробуем
+  // точное совпадение по названию; если его нет — смотрим частичные
+  // совпадения, и если их больше одного, ЧЕСТНО сообщаем о неоднозначности,
+  // а не гадаем.
   async function tryByName() {
     if (!name || name.trim().length < 3) return null;
     const cleanName = name.trim().replace(/'/g, "''");
-    const filter = encodeURIComponent(`substringof('${cleanName}', Description)`);
-    const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}&$top=1`;
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) return null;
-    const data = await response.json().catch(() => null);
-    return (data && data.value && data.value[0]) || null;
+
+    // 1. Точное совпадение — самый надёжный вариант
+    const exactFilter = encodeURIComponent(`Description eq '${cleanName}'`);
+    const exactUrl = `${base}/Catalog_Контрагенты?$format=json&$filter=${exactFilter}&$top=2`;
+    const exactResp = await fetch(exactUrl, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (exactResp.ok) {
+      const exactData = await exactResp.json().catch(() => null);
+      const exactList = (exactData && exactData.value) || [];
+      if (exactList.length === 1) return { match: exactList[0] };
+      if (exactList.length > 1) return { ambiguous: true, options: exactList };
+    }
+
+    // 2. Частичное совпадение — смотрим, сколько всего нашлось (до 5, чтобы
+    // не тянуть слишком много), и решаем по количеству.
+    const partialFilter = encodeURIComponent(`substringof('${cleanName}', Description)`);
+    const partialUrl = `${base}/Catalog_Контрагенты?$format=json&$filter=${partialFilter}&$top=5`;
+    const partialResp = await fetch(partialUrl, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!partialResp.ok) return null;
+    const partialData = await partialResp.json().catch(() => null);
+    const partialList = (partialData && partialData.value) || [];
+    if (partialList.length === 0) return null;
+    if (partialList.length === 1) return { match: partialList[0] };
+    return { ambiguous: true, options: partialList };
+  }
+
+  async function resolveByName() {
+    const r = await tryByName();
+    if (!r) return null;
+    if (r.ambiguous) {
+      const err = new Error(
+        `По имени "${name}" в справочнике нашлось ${r.options.length} разных контрагентов ` +
+        `(${r.options.map(o => o.Description).join(', ')}) — не могу понять, какой из них правильный. ` +
+        `Сопоставьте контрагента вручную для этой операции.`
+      );
+      err.ambiguousCounterparty = r.options;
+      throw err;
+    }
+    return r.match;
   }
 
   // Если рабочее поле уже определено — сразу используем его.
@@ -1667,12 +1810,12 @@ async function findCounterpartyByBin(bin, settings, name) {
     const r = await tryField(workingBinField);
     if (r.fieldExists) {
       if (r.found) return r.found;
-      return await tryByName(); // БИН не совпал — пробуем по названию
+      return await resolveByName(); // БИН не совпал — пробуем по названию
     }
     workingBinField = null; // поле перестало работать — определим заново
   }
 
-  if (!bin) return await tryByName(); // БИН в выписке пуст — сразу по названию
+  if (!bin) return await resolveByName(); // БИН в выписке пуст — сразу по названию
 
   const errors = [];
   for (const field of BIN_FIELD_CANDIDATES) {
@@ -1680,18 +1823,13 @@ async function findCounterpartyByBin(bin, settings, name) {
     if (r.fieldExists) {
       workingBinField = field; // запомнили — дальше будет быстро
       if (r.found) return r.found;
-      return await tryByName(); // поле рабочее, но по БИН не нашли — пробуем по названию
+      return await resolveByName(); // поле рабочее, но по БИН не нашли — пробуем по названию
     }
     errors.push(field);
   }
   // Ни одно поле с БИН не сработало вообще — прежде чем сдаться, всё
   // равно пробуем по названию.
-  const byName = await tryByName();
-  if (byName) return byName;
-  throw new Error(
-    `В справочнике контрагентов не нашлось поля с БИН/ИИН. Пробовали: ${errors.join(', ')}. ` +
-    `Откройте в браузере адрес вашей базы + /Catalog_Контрагенты?$format=json&$top=1 и посмотрите, как называется поле с БИН — я добавлю его в список.`
-  );
+  return await resolveByName();
 }
 
 // Создаёт нового контрагента в справочнике 1С по данным из операции выписки.
