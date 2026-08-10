@@ -814,6 +814,29 @@ function toIsoDate(dateStr) {
   return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T00:00:00`;
 }
 
+// Точные внутренние имена для "Вида операции" — 1С хранит их слитно,
+// без пробелов, с заглавной буквы у каждого слова, а не так, как
+// показывает на экране. Подтверждённые значения (проверены напрямую
+// через OData на вашей базе) — самые надёжные. Для остальных пунктов
+// того же списка используется тот же принцип именования как обоснованная
+// попытка — если она окажется неверной, при создании документа мы просто
+// не отправим это поле, а не провалим создание черновика целиком.
+const CONFIRMED_OPERATION_KINDS = {
+  'перечисление денежных средств подотчетнику': 'ПеречислениеДенежныхСредствПодотчетнику',
+};
+function guessOperationKindLiteral(text) {
+  const normalized = String(text || '').toLowerCase().trim();
+  if (CONFIRMED_OPERATION_KINDS[normalized]) return CONFIRMED_OPERATION_KINDS[normalized];
+  if (!text) return null;
+  // Обоснованная попытка: каждое слово с заглавной буквы, слитно, без
+  // знаков препинания — так называет свои перечисления 1С в этом списке.
+  return String(text)
+    .split(/[\s.,]+/)
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join('');
+}
+
 function baseDefault(amount) {
   return amount >= 0
     ? { category: 'Реализация работ и услуг', account: '1210/3510' }
@@ -1907,15 +1930,19 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   }
   if (categoryKey) payload.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
 
-  // ВАЖНО: "Вид операции" — это не текстовое поле, а строгий список
-  // (перечисление) в 1С. Туда можно передать только значение, которое там
-  // реально существует, иначе 1С отвечает ошибкой вида "Перечисление ...
-  // не содержит элемент '...'". Свободный текст из правил/ручной правки
-  // сюда НЕ отправляем — только значение, скопированное из уже
-  // существующего документа в истории (оно гарантированно валидно, так
-  // как пришло из самой 1С).
+  // "Вид операции" — строгий список в 1С. Приоритет:
+  //   1. История (скопировано с уже существующего документа — 100% верно)
+  //   2. Подтверждённое точное значение (проверено напрямую через вашу базу)
+  //   3. Обоснованная попытка по тому же принципу именования — если 1С её
+  //      отклонит, мы автоматически повторим запрос без этого поля (см. ниже).
+  let operationKindLiteral = null;
   if (op.historicalOperationKind) {
-    payload.ВидОперации = op.historicalOperationKind;
+    operationKindLiteral = op.historicalOperationKind;
+  } else if (resolvedOperationKind) {
+    operationKindLiteral = guessOperationKindLiteral(resolvedOperationKind);
+  }
+  if (operationKindLiteral) {
+    payload.ВидОперации = operationKindLiteral;
   }
 
   // Договор — привязываем, только если найден однозначно. Если у
@@ -1970,6 +1997,20 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   }
 
   let response = await postDocument(payload);
+  let currentPayload = payload;
+
+  // Если 1С отклонила запрос из-за "Вида операции" (наша попытка угадать
+  // точное внутреннее имя оказалась неверной) — пробуем ещё раз без этого
+  // поля, чтобы черновик всё равно создался, просто без автозаполнения
+  // этого одного поля.
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    if (text.includes('ВидыОпераций') && currentPayload.ВидОперации) {
+      const { ВидОперации, ...withoutOpKind } = currentPayload;
+      currentPayload = withoutOpKind;
+      response = await postDocument(currentPayload);
+    }
+  }
 
   if (!response.ok) {
     const text = await response.text().catch(() => '');
@@ -1978,7 +2019,7 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
     // создать документ без неё, чтобы он хотя бы появился как черновик,
     // а таблицу внутри можно будет дозаполнить вручную в 1С.
     if (text.includes('РасшифровкаПлатежа')) {
-      const { РасшифровкаПлатежа, ...withoutTable } = payload;
+      const { РасшифровкаПлатежа, ...withoutTable } = currentPayload;
       response = await postDocument(withoutTable);
       if (!response.ok) {
         const text2 = await response.text().catch(() => '');
