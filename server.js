@@ -889,6 +889,27 @@ function normalizeScript(s) {
   return String(s || '').split('').map(ch => SCRIPT_NORMALIZE_MAP[ch] || ch).join('');
 }
 
+// Некоторые банки (замечено на выгрузках .xls БЦК / БЦК Бизнес) до сих пор
+// используют старую до-юникодную казахскую кодировку для казахских букв: в
+// тексте вместо Ә/ә стоит македонская/сербская Ј/ј, а вместо Қ/қ — Ќ/ќ.
+// В Excel это выглядит почти неотличимо от нормального написания, но байты
+// другие — из-за этого сопоставление контрагента по имени не находит уже
+// существующую в 1С запись с правильным написанием и создаёт дубль с
+// испорченным именем. Эти четыре символа не встречаются в казахском/русском
+// тексте ни в каком легитимном случае, поэтому исправляем их без риска
+// испортить что-то другое. Если найдутся другие письма с похожей порчей
+// других казахских букв — карту можно будет расширить.
+const KAZAKH_MOJIBAKE_MAP = { 'Ј': 'Ә', 'ј': 'ә', 'Ќ': 'Қ', 'ќ': 'қ' };
+function fixKazakhMojibake(s) {
+  const str = String(s || '');
+  let hasMojibake = false;
+  for (const ch of str) {
+    if (KAZAKH_MOJIBAKE_MAP[ch]) { hasMojibake = true; break; }
+  }
+  if (!hasMojibake) return str;
+  return str.split('').map(ch => KAZAKH_MOJIBAKE_MAP[ch] || ch).join('');
+}
+
 // Правило может проверять назначение платежа, имя контрагента ИЛИ КНП
 // (код назначения платежа — стандартный классификатор, который банки РК
 // присылают прямо в выписке). normalizeRuleField приводит любое сырое
@@ -1159,9 +1180,9 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
       operations.push({
         id: crypto.randomUUID(),
         date: dateRaw.split(' ')[0] || dateRaw,
-        counterparty: cols.counterparty !== -1 ? String(row[cols.counterparty] || '') : '',
+        counterparty: fixKazakhMojibake(cols.counterparty !== -1 ? row[cols.counterparty] : ''),
         bin: String(bin || '').trim(),
-        purpose: cols.purpose !== -1 ? String(row[cols.purpose] || '') : '',
+        purpose: fixKazakhMojibake(cols.purpose !== -1 ? row[cols.purpose] : ''),
         knp: cols.knp !== -1 ? String(row[cols.knp] || '') : '', // код назначения платежа — берём прямо из выписки банка
         amount,
         suggestedCategory: '',
@@ -1190,9 +1211,9 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
       return {
         id: crypto.randomUUID(),
         date: String(dateRaw || ''),
-        counterparty: String(pick(row, ['контрагент', 'наименование контрагента', 'плательщик/получатель']) || ''),
+        counterparty: fixKazakhMojibake(pick(row, ['контрагент', 'наименование контрагента', 'плательщик/получатель'])),
         bin: String(pick(row, ['бин', 'иин', 'бин/иин']) || ''),
-        purpose: String(pick(row, ['назначение платежа', 'назначение', 'комментарий']) || ''),
+        purpose: fixKazakhMojibake(pick(row, ['назначение платежа', 'назначение', 'комментарий'])),
         knp: String(pick(row, ['кнп', 'код назначения платежа', 'тмк']) || ''),
         amount,
         suggestedCategory: '',
@@ -1407,8 +1428,15 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     op.status = 'draft_created';
     op.onecDocNumber = result.docNumber || null;
     await setStore('operations', all);
-    await addHistory(`Создан черновик в 1С: ${op.counterparty || 'операция'} · ${op.amount} ₸ · статья: ${category}`, result.docNumber || '—');
-    res.json({ ok: true, op });
+    // Если какие-то поля (счёт учёта, подотчётник и т.п.) не прижились в вашей
+    // конфигурации 1С — черновик всё равно создаётся, но мы честно пишем в
+    // историю, что именно не заполнилось, чтобы можно было доглядеть глазами
+    // и, при желании, прислать нам точный текст ошибки для донастройки.
+    const droppedNote = result.droppedFields && result.droppedFields.length
+      ? ` · 1С не приняла поля: ${result.droppedFields.join(', ')} — проверьте их вручную в документе`
+      : '';
+    await addHistory(`Создан черновик в 1С: ${op.counterparty || 'операция'} · ${op.amount} ₸ · статья: ${category}${droppedNote}`, result.docNumber || '—');
+    res.json({ ok: true, op, droppedFields: result.droppedFields || [] });
   } catch (e) {
     await addHistory(`Ошибка при создании черновика: ${e.message}`, '—');
     res.status(502).json({ error: 'Не удалось создать документ в 1С: ' + e.message });
@@ -1744,6 +1772,48 @@ async function findCategoryKeyByName(name, settings) {
   return null;
 }
 
+// "Счёт учёта (БУ)" в табличной части документа — это ссылка на план счетов
+// (Chart of Accounts), а не просто текст "1251": нужно найти GUID счёта по
+// его коду. Название самого объекта плана счетов в OData отличается между
+// конфигурациями 1С — пробуем частые варианты и запоминаем рабочий, как и с
+// полем БИН/ИИН. Счёт может храниться у нас как пара "1251/3510"
+// (счёт расчётов/счёт авансов) — для табличной части берём основную часть
+// до "/".
+const CHART_OF_ACCOUNTS_CANDIDATES = ['ChartOfAccounts_Хозрасчетный', 'ChartOfAccounts_Хозрасчетный2', 'ChartOfAccounts_Управленческий'];
+let workingChartOfAccounts = null;
+
+async function findAccountKeyByCode(code, settings) {
+  if (!code) return null;
+  const primaryCode = String(code).split('/')[0].trim();
+  if (!primaryCode) return null;
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+
+  async function tryChart(chart) {
+    const filter = encodeURIComponent(`Code eq '${primaryCode}'`);
+    const url = `${base}/${chart}?$format=json&$filter=${filter}&$select=Ref_Key&$top=1`;
+    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!response.ok) return { exists: false };
+    const data = await response.json().catch(() => null);
+    if (!data) return { exists: false };
+    return { exists: true, found: (data.value || [])[0] || null };
+  }
+
+  if (workingChartOfAccounts) {
+    const r = await tryChart(workingChartOfAccounts);
+    if (r.exists) return r.found ? r.found.Ref_Key : null;
+    workingChartOfAccounts = null;
+  }
+  for (const chart of CHART_OF_ACCOUNTS_CANDIDATES) {
+    const r = await tryChart(chart);
+    if (r.exists) {
+      workingChartOfAccounts = chart;
+      return r.found ? r.found.Ref_Key : null;
+    }
+  }
+  return null; // ни один вариант плана счетов не подошёл — не страшно, просто не заполним это поле
+}
+
 async function findHistoricalCategory(counterpartyKey, amount, settings, currentPurpose) {
   if (!counterpartyKey) return null;
   const base = settings.baseUrl.replace(/\/+$/, '');
@@ -2038,9 +2108,33 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   };
   if (op.contractKey) lineItem.Договор_Key = op.contractKey;
   if (categoryKey) lineItem.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
-  // Тот же принцип, что и с "Видом операции" — "Вид задолженности" тоже
-  // строгий список, свободный текст туда передавать нельзя.
-  if (op.historicalDebtType) lineItem.ВидЗадолженности = op.historicalDebtType;
+
+  // "Вид задолженности" — раньше бралось ТОЛЬКО из истории 1С; если у
+  // контрагента ещё нет истории, поле молча оставалось пустым, даже если
+  // resolvedDebtType (из правила/ручной правки/подстановки по умолчанию)
+  // был известен. Приоритет: история 1С (100% верно) > то, что определили
+  // для этой операции.
+  const debtTypeValue = op.historicalDebtType || resolvedDebtType || '';
+  if (debtTypeValue) lineItem.ВидЗадолженности = debtTypeValue;
+
+  // "Счёт учёта (БУ)" в табличной части — ищем GUID счёта по коду
+  // (resolvedAccount, например "1251"). Раньше resolvedAccount вообще не
+  // использовался внутри этой функции — счёт нигде не попадал в документ.
+  const accountKey = await findAccountKeyByCode(resolvedAccount, settings);
+  if (accountKey) lineItem.СчетУчета_Key = accountKey;
+
+  // "Подотчётник" — отдельное поле табличной части именно для операции
+  // "Перечисление денежных средств подотчётнику": получатель там обычно
+  // указывается той же ссылкой, что и Контрагент_Key в шапке документа.
+  // Добавляем это поле, только когда вид операции действительно про
+  // подотчётные средства — на остальных документах такого поля нет.
+  const isAccountablePersonPayment = /подотчет/i.test(
+    String(resolvedOperationKind || '') + ' ' + String(op.historicalOperationKind || '')
+  );
+  if (isAccountablePersonPayment && op.counterpartyKey) {
+    lineItem.Подотчетник_Key = op.counterpartyKey;
+  }
+
   payload.РасшифровкаПлатежа = [lineItem];
 
   if (!op.counterpartyKey) {
@@ -2059,42 +2153,69 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
     });
   }
 
-  let response = await postDocument(payload);
-  let currentPayload = payload;
-
-  // Если 1С отклонила запрос из-за "Вида операции" (наша попытка угадать
-  // точное внутреннее имя оказалась неверной) — пробуем ещё раз без этого
-  // поля, чтобы черновик всё равно создался, просто без автозаполнения
-  // этого одного поля.
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    if (text.includes('ВидыОпераций') && currentPayload.ВидОперации) {
-      const { ВидОперации, ...withoutOpKind } = currentPayload;
-      currentPayload = withoutOpKind;
-      response = await postDocument(currentPayload);
+  // Точные названия некоторых полей (Подотчетник_Key, СчетУчета_Key и т.п.)
+  // мы не можем угадать со 100% гарантией без доступа к вашей конкретной базе
+  // 1С — они могут называться иначе в вашей конфигурации. Поэтому вместо
+  // того чтобы один раз попробовать и в случае ошибки просто провалить
+  // создание черновика целиком — если 1С отвечает ошибкой, ссылающейся на
+  // одно из НЕОБЯЗАТЕЛЬНЫХ полей ниже, мы убираем именно это поле (и из
+  // шапки документа, и из строки табличной части) и пробуем снова. Так
+  // черновик создаётся почти всегда, а какие поля не прижились — видно в
+  // истории действий (see /api/operations/:id/confirm), чтобы можно было
+  // подсказать нам точное название поля под вашу конфигурацию.
+  const OPTIONAL_FIELDS = [
+    'ВидОперации',
+    'Договор_Key',
+    'СтатьяДвиженияДенежныхСредств_Key',
+    'ВидЗадолженности',
+    'Подотчетник_Key',
+    'СчетУчета_Key',
+    'РасшифровкаПлатежа',
+  ];
+  function fieldIsPresent(payloadObj, fieldName) {
+    if (fieldName in payloadObj) return true;
+    return Array.isArray(payloadObj.РасшифровкаПлатежа) && payloadObj.РасшифровкаПлатежа.some(row => fieldName in row);
+  }
+  function stripOptionalField(payloadObj, fieldName) {
+    if (fieldName === 'РасшифровкаПлатежа') {
+      const { РасшифровкаПлатежа, ...rest } = payloadObj;
+      return rest;
     }
+    const clone = { ...payloadObj };
+    delete clone[fieldName];
+    if (Array.isArray(clone.РасшифровкаПлатежа)) {
+      clone.РасшифровкаПлатежа = clone.РасшифровкаПлатежа.map(row => {
+        if (!(fieldName in row)) return row;
+        const rowCopy = { ...row };
+        delete rowCopy[fieldName];
+        return rowCopy;
+      });
+    }
+    return clone;
   }
 
-  if (!response.ok) {
+  let currentPayload = payload;
+  let response = await postDocument(currentPayload);
+  const droppedFields = [];
+  let safetyCounter = 0;
+  while (!response.ok && safetyCounter < OPTIONAL_FIELDS.length) {
+    safetyCounter++;
     const text = await response.text().catch(() => '');
-    // Если 1С не приняла именно табличную часть "РасшифровкаПлатежа"
-    // (например, в вашей конфигурации она называется иначе) — пробуем
-    // создать документ без неё, чтобы он хотя бы появился как черновик,
-    // а таблицу внутри можно будет дозаполнить вручную в 1С.
-    if (text.includes('РасшифровкаПлатежа')) {
-      const { РасшифровкаПлатежа, ...withoutTable } = currentPayload;
-      response = await postDocument(withoutTable);
-      if (!response.ok) {
-        const text2 = await response.text().catch(() => '');
-        throw new Error(`1С ответила ${response.status}: ${text2.slice(0, 300)}`);
-      }
-    } else {
+    const badField = OPTIONAL_FIELDS.find(f => fieldIsPresent(currentPayload, f) && text.includes(f));
+    if (!badField) {
       throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
     }
+    droppedFields.push(badField);
+    currentPayload = stripOptionalField(currentPayload, badField);
+    response = await postDocument(currentPayload);
+  }
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
   }
 
   const data = await response.json().catch(() => ({}));
-  return { docNumber: data.Number || null };
+  return { docNumber: data.Number || null, droppedFields };
 }
 
 // ---------- начальные данные при первом запуске / восстановление после передеплоя ----------
