@@ -419,6 +419,10 @@ function money(v){ const sign = v>0?'+':''; return sign + v.toLocaleString('ru-R
 
 const expandedOps = new Set();
 
+function escapeHtml(s){
+  return String(s || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
 async function loadOperations(){
   const ops = await api('/api/operations');
   const list = document.getElementById('review-list');
@@ -472,7 +476,7 @@ async function loadOperations(){
       actionHtml = '';
     } else if(isNew){
       statusHtml = '<span class="pill pill-new">Новый контрагент</span>';
-      actionHtml = '<button class="icon-btn" onclick="event.stopPropagation();createCounterparty(\\''+o.id+'\\')">Создать контрагента</button>';
+      actionHtml = '<span style="font-size:11px;color:var(--muted);">проверьте ниже ↓</span>';
     } else if(ambiguousCounterparty){
       statusHtml = '<span class="pill pill-new">Несколько контрагентов — выбрать</span>';
       actionHtml = '<span style="font-size:11px;color:var(--muted);">выберите ниже ↓</span>';
@@ -515,6 +519,20 @@ async function loadOperations(){
             \${(o.counterpartyOptions||[]).map(c => \`<option value="\${c.key}">\${c.name}</option>\`).join('')}
           </select>
           <button class="btn btn-primary" style="padding:7px 12px;font-size:12.5px;" onclick="event.stopPropagation();chooseCounterparty('\${o.id}')">Выбрать этого контрагента</button>
+        </div>
+        \` : ''}
+        \${isNew ? \`
+        <div style="background:var(--red-soft);border:1px solid var(--red);border-radius:8px;padding:12px 14px;margin-bottom:14px;">
+          <div style="font-size:12.5px;color:var(--red);margin-bottom:10px;">Контрагент не найден автоматически. Прежде чем создавать нового — проверьте, нет ли он уже в 1С под другим написанием:</div>
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <input id="search-cp-\${o.id}" placeholder="Часть названия для поиска в 1С" style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:6px;font-size:13px;" onkeydown="if(event.key==='Enter'){event.preventDefault();searchCounterparty('\${o.id}');}">
+            <button class="btn btn-ghost" style="padding:7px 12px;font-size:12.5px;" onclick="event.stopPropagation();searchCounterparty('\${o.id}')">Искать в 1С</button>
+          </div>
+          <div id="search-cp-results-\${o.id}" style="margin-bottom:10px;"></div>
+          <div style="display:flex;align-items:center;gap:10px;border-top:1px solid var(--line);padding-top:10px;">
+            <span style="font-size:12px;color:var(--muted);">Проверили — такого контрагента правда нет:</span>
+            <button class="icon-btn confirm" onclick="event.stopPropagation();createCounterparty('\${o.id}')">Создать нового</button>
+          </div>
         </div>
         \` : ''}
         <div class="op-detail-grid">
@@ -615,6 +633,35 @@ async function chooseCounterparty(id){
   if(!select) return;
   const key = select.value;
   const name = select.options[select.selectedIndex].text;
+  try{
+    await api('/api/operations/'+id+'/choose-counterparty', {method:'POST', body: JSON.stringify({counterpartyKey: key, counterpartyName: name})});
+    loadOperations(); loadHistory();
+  }catch(e){ alert(e.message); }
+}
+
+async function searchCounterparty(id){
+  const input = document.getElementById('search-cp-'+id);
+  const resultsBox = document.getElementById('search-cp-results-'+id);
+  if(!input || !resultsBox) return;
+  const query = input.value.trim();
+  if(!query){ resultsBox.innerHTML = '<span style="font-size:12px;color:var(--muted);">Введите часть названия</span>'; return; }
+  resultsBox.innerHTML = '<span style="font-size:12px;color:var(--muted);">Ищу в 1С…</span>';
+  try{
+    const result = await api('/api/operations/'+id+'/search-counterparty', {method:'POST', body: JSON.stringify({query})});
+    if(!result.options.length){
+      resultsBox.innerHTML = '<span style="font-size:12px;color:var(--muted);">Ничего не найдено — похоже, контрагента в 1С действительно ещё нет.</span>';
+      return;
+    }
+    resultsBox.innerHTML = result.options.map(o => \`
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--line-soft);font-size:12.5px;">
+        <span>\${escapeHtml(o.name)}</span>
+        <button class="icon-btn confirm" onclick="event.stopPropagation();pickSearchedCounterparty('\${id}','\${o.key}','\${o.name.replace(/'/g,"\\\\'").replace(/"/g,'&quot;')}')">Это он</button>
+      </div>
+    \`).join('');
+  }catch(e){ resultsBox.innerHTML = '<span style="font-size:12px;color:var(--red);">'+e.message+'</span>'; }
+}
+
+async function pickSearchedCounterparty(id, key, name){
   try{
     await api('/api/operations/'+id+'/choose-counterparty', {method:'POST', body: JSON.stringify({counterpartyKey: key, counterpartyName: name})});
     loadOperations(); loadHistory();
@@ -1580,6 +1627,36 @@ app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res
   }
 });
 
+// ---------- ручной поиск контрагента в 1С (когда автопоиск ничего не нашёл) ----------
+// Раньше при статусе "Новый контрагент" было только одно действие — создать
+// нового. Это опасно, если контрагент на самом деле уже есть в 1С, просто
+// автопоиск его не нашёл (например, из-за другого написания названия) —
+// получалось задвоение. Теперь перед созданием можно вручную поискать в
+// справочнике 1С и выбрать существующего вместо создания нового (кнопка
+// "Это он" в интерфейсе вызывает уже существующий /choose-counterparty).
+app.post('/api/operations/:id/search-counterparty', requireAuth, async (req, res) => {
+  const all = await getStore('operations', []);
+  const op = all.find(o => o.id === req.params.id);
+  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
+
+  const { query } = req.body;
+  if (!query || query.trim().length < 2) {
+    return res.status(400).json({ error: 'Введите минимум 2 символа для поиска' });
+  }
+
+  const settings = await getStore('settings', {});
+  if (!settings.baseUrl) {
+    return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
+  }
+
+  try {
+    const results = await searchCounterpartyByText(query.trim(), settings);
+    res.json({ options: results.map(o => ({ key: o.Ref_Key, name: o.Description })) });
+  } catch (e) {
+    res.status(502).json({ error: 'Не удалось выполнить поиск: ' + e.message });
+  }
+});
+
 // ---------- правила категоризации (редактируются прямо в кабинете) ----------
 app.get('/api/rules', requireAuth, async (req, res) => {
   res.json(await getStore('rules', []));
@@ -1986,6 +2063,26 @@ async function findCounterpartyByBin(bin, settings, name) {
   // Ни одно поле с БИН не сработало вообще — прежде чем сдаться, всё
   // равно пробуем по названию.
   return await resolveByName();
+}
+
+// Свободный ручной поиск контрагента по части названия — используется, когда
+// бухгалтер сам проверяет "а нет ли он уже в 1С", прежде чем соглашаться на
+// создание нового. В отличие от tryByName() внутри findCounterpartyByBin (та
+// возвращает ошибку при неоднозначности), здесь мы, наоборот, ХОТИМ увидеть
+// все подходящие варианты списком, чтобы человек выбрал нужный сам.
+async function searchCounterpartyByText(query, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const cleanQuery = query.replace(/'/g, "''");
+  const filter = encodeURIComponent(`substringof('${cleanQuery}', Description)`);
+  const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}&$select=Ref_Key,Description&$top=20`;
+  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 200)}`);
+  }
+  const data = await response.json().catch(() => null);
+  return (data && data.value) || [];
 }
 
 // Создаёт нового контрагента в справочнике 1С по данным из операции выписки.
