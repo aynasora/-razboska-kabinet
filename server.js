@@ -460,6 +460,7 @@ async function loadOperations(){
     const already = o.status==='already_in_1c';
     const hasCategory = !!o.suggestedCategory;
     const contractAmbiguous = o.contractStatus === 'ambiguous';
+    const needsNoContract = o.contractStatus === 'need_create_no_contract' && !o.contractKey;
     // Бывает, что операция загружена ДО того, как подключение к 1С было
     // настроено — тогда сопоставление контрагента не выполнялось вообще,
     // но статус остался обычным "review". Без реального Ref_Key
@@ -493,7 +494,11 @@ async function loadOperations(){
       statusHtml = '<span class="pill pill-review">На проверке</span>';
       actionHtml = '<button class="icon-btn confirm" onclick="event.stopPropagation();confirmOp(\\''+o.id+'\\')">Подтвердить</button>';
     }
-    const contractText = contractAmbiguous ? '<span style="color:var(--red)">несколько — выбрать вручную</span>' : (o.contractName || '—');
+    const contractText = contractAmbiguous
+      ? '<span style="color:var(--red)">несколько — выбрать вручную</span>'
+      : needsNoContract
+        ? '<span style="color:var(--brass);">не найден — <a href="#" onclick="event.preventDefault();event.stopPropagation();createNoContract(\'' + o.id + '\')">создать «Без договора»</a></span>'
+        : (o.contractName || '—');
     const isExpanded = expandedOps.has(o.id);
     const defaultHint = o.isDefaultOnly ? ' <span style="color:var(--brass);font-size:11px;">(по умолчанию — проверьте)</span>' : '';
 
@@ -617,6 +622,13 @@ async function confirmOp(id){
 async function createCounterparty(id){
   try{
     await api('/api/operations/'+id+'/create-counterparty', {method:'POST'});
+    loadOperations(); loadHistory();
+  }catch(e){ alert(e.message); }
+}
+
+async function createNoContract(id){
+  try{
+    await api('/api/operations/'+id+'/create-no-contract', {method:'POST'});
     loadOperations(); loadHistory();
   }catch(e){ alert(e.message); }
 }
@@ -955,6 +967,21 @@ function fixKazakhMojibake(s) {
   }
   if (!hasMojibake) return str;
   return str.split('').map(ch => KAZAKH_MOJIBAKE_MAP[ch] || ch).join('');
+}
+
+// Организационно-правовая форма (ТОО/ИП/АО и т.п.) и кавычки часто пишутся
+// по-разному в банковской выписке и в справочнике 1С ("ТОО Ромашка" vs
+// "Ромашка" vs "\"Ромашка\" ТОО") — из-за этого поиск по точному названию
+// не находит контрагента, который на самом деле уже есть. normalizeCounterpartyName
+// убирает эти различия, оставляя только "ядро" названия для сравнения.
+const LEGAL_FORM_WORDS = ['тоо', 'жшс', 'ип', 'ао', 'оао', 'зао', 'чуп', 'гу', 'пк', 'кх', 'офз', 'фх', 'нао'];
+function normalizeCounterpartyName(name) {
+  let s = String(name || '').toLowerCase();
+  s = s.replace(/["'«»„“”`]/g, ' ');
+  for (const word of LEGAL_FORM_WORDS) {
+    s = s.replace(new RegExp(`(^|\\s)${word}(\\s|$)`, 'g'), ' ');
+  }
+  return s.replace(/\s+/g, ' ').trim();
 }
 
 // Правило может проверять назначение платежа, имя контрагента ИЛИ КНП
@@ -1331,7 +1358,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
           // Ищем договор контрагента — если он есть в справочнике и найден
           // однозначно, привяжем его к документу автоматически.
           try {
-            const contract = await findContractForCounterparty(found.Ref_Key, op.purpose, settingsForMatch);
+            const contract = await resolveSupplierContract(found.Ref_Key, op.purpose, settingsForMatch);
             target.contractStatus = contract.status;
             if (contract.status === 'matched') {
               target.contractKey = contract.key;
@@ -1456,10 +1483,95 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
   }
 
+  // ПЕРЕПРОВЕРКА С 1С ПРЯМО ПЕРЕД СОЗДАНИЕМ ДОКУМЕНТА. Данные, с которыми
+  // сопоставлялась операция, могли устареть с момента загрузки выписки —
+  // между загрузкой и подтверждением могло пройти много времени, кто-то
+  // мог создать тот же документ вручную, появиться новые проводки по
+  // контрагенту и т.д. Поэтому перед составлением документа не полагаемся
+  // на то, что было найдено при загрузке, а анализируем 1С заново.
+
+  // 1. Ещё раз проверяем, не появился ли уже такой документ в 1С (та же
+  // дата и сумма) — чтобы не создать дубль, даже если при загрузке
+  // выписки его ещё не было.
+  try {
+    const alreadyExists = await checkExistingInOnec(op, settings);
+    if (alreadyExists) {
+      op.status = 'already_in_1c';
+      await setStore('operations', all);
+      await addHistory(`Перепроверка перед подтверждением: в 1С уже есть такой документ — черновик не создаём (${op.counterparty || 'операция'})`, '—');
+      return res.status(409).json({ error: 'В 1С уже есть документ с такой же датой и суммой — черновик не создан, чтобы не задвоить. Операция помечена как «Уже в 1С».', op });
+    }
+  } catch (e) {
+    // Если сверка технически не удалась (например, база временно недоступна) —
+    // не блокируем работу, идём дальше с тем, что уже известно.
+  }
+
+  // 2. Заново анализируем контрагента и проводки по нему: если контрагент
+  // ещё не был сопоставлен (например, операция загружалась без
+  // подключения к 1С) — сопоставляем сейчас; если уже сопоставлен —
+  // обновляем историческую категорию/договор по самым свежим проводкам,
+  // а не по тому, что было найдено когда-то при загрузке.
+  if (!op.counterpartyKey && op.bin) {
+    try {
+      const found = await findCounterpartyByBin(op.bin, settings, op.counterparty);
+      if (found) {
+        op.counterpartyKey = found.Ref_Key;
+        op.counterpartyMatchedName = found.Description || '';
+      } else {
+        op.status = 'new_counterparty';
+      }
+    } catch (e) {
+      if (e.ambiguousCounterparty) {
+        // Несколько похожих контрагентов — не гадаем, останавливаемся и
+        // просим выбрать вручную (та же механика, что при загрузке выписки).
+        op.status = 'ambiguous_counterparty';
+        op.counterpartyOptions = e.ambiguousCounterparty.map(o => ({ key: o.Ref_Key, name: o.Description }));
+      }
+      // Иначе — сверка технически не удалась, продолжаем без
+      // автосопоставления, ниже сработает обычная проверка "контрагент не
+      // сопоставлен".
+    }
+  }
+  if (op.status === 'new_counterparty' || op.status === 'ambiguous_counterparty') {
+    await setStore('operations', all);
+    return res.status(400).json({
+      error: 'Контрагент не сопоставлен с 1С — сначала обработайте это в карточке операции (создайте контрагента или выберите из найденных вариантов).',
+      op,
+    });
+  }
+  if (op.counterpartyKey) {
+    try {
+      const historical = await findHistoricalCategory(op.counterpartyKey, op.amount, settings, op.purpose);
+      if (historical) {
+        op.historicalCategory = historical.categoryName || op.historicalCategory || '';
+        op.historicalCategoryKey = historical.categoryKey || op.historicalCategoryKey || null;
+        op.historicalOperationKind = historical.operationKind || op.historicalOperationKind || '';
+        op.historicalDebtType = historical.debtType || op.historicalDebtType || '';
+      }
+    } catch (e) {
+      // Не критично — используем то, что было определено раньше (если было).
+    }
+    try {
+      const contract = await resolveSupplierContract(op.counterpartyKey, op.purpose, settings);
+      if (contract) {
+        op.contractStatus = contract.status;
+        if (contract.status === 'matched') {
+          op.contractKey = contract.key;
+          op.contractName = contract.name;
+        } else if (contract.status === 'ambiguous') {
+          op.contractOptions = contract.options;
+        }
+      }
+    } catch (e) {
+      // Не критично — используем то, что было определено раньше.
+    }
+  }
+  await setStore('operations', all);
+
   // Статья ДДС обязательна — без неё документ не создаём. Приоритет:
-  // ручная правка > история 1С > правила > базовая логика (которая
-  // всегда что-то определяет, так что пусто может быть, только если
-  // что-то совсем не так с данными).
+  // ручная правка > история 1С (уже обновлённая на шаге перепроверки выше)
+  // > правила > базовая логика (которая всегда что-то определяет, так что
+  // пусто может быть, только если что-то совсем не так с данными).
   const rules = await getStore('rules', []);
   const ruleMatch = applyRules(op, rules);
   const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
@@ -1514,7 +1626,7 @@ app.post('/api/operations/:id/choose-counterparty', requireAuth, async (req, res
         op.historicalOperationKind = historical.operationKind || '';
         op.historicalDebtType = historical.debtType || '';
       }
-      const contract = await findContractForCounterparty(counterpartyKey, op.purpose, settings);
+      const contract = await resolveSupplierContract(counterpartyKey, op.purpose, settings);
       if (contract) {
         op.contractStatus = contract.status;
         if (contract.status === 'matched') {
@@ -1568,7 +1680,7 @@ app.post('/api/operations/:id/rematch', requireAuth, async (req, res) => {
           op.historicalOperationKind = historical.operationKind || '';
         }
 
-        const contract = await findContractForCounterparty(found.Ref_Key, op.purpose, settings).catch(() => null);
+        const contract = await resolveSupplierContract(found.Ref_Key, op.purpose, settings).catch(() => null);
         if (contract) {
           op.contractStatus = contract.status;
           if (contract.status === 'matched') {
@@ -1603,27 +1715,76 @@ app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res
   }
 
   try {
-    // На всякий случай проверяем ещё раз прямо перед созданием — вдруг
-    // контрагент уже появился в 1С (например, кто-то создал его вручную).
+    // На всякий случай проверяем ещё раз прямо перед тем, как отвечать —
+    // вдруг контрагент уже появился в 1С (например, кто-то создал его
+    // вручную, или его нашли через ручной поиск /search-counterparty).
     const existing = await findCounterpartyByBin(op.bin, settings, op.counterparty);
-    let key, name;
     if (existing) {
-      key = existing.Ref_Key;
-      name = existing.Description;
-    } else {
-      const created = await createCounterpartyInOnec(op, settings);
-      key = created.Ref_Key;
-      name = created.Description;
+      op.counterpartyKey = existing.Ref_Key;
+      op.counterpartyMatchedName = existing.Description;
+      op.status = 'review'; // теперь контрагент есть — можно подтверждать документ как обычно
+      await setStore('operations', all);
+      await addHistory(`Контрагент найден в 1С при повторной проверке: ${existing.Description} (БИН ${op.bin})`, '—');
+      return res.json({ ok: true, op });
     }
-    op.counterpartyKey = key;
-    op.counterpartyMatchedName = name;
-    op.status = 'review'; // теперь контрагент есть — можно подтверждать документ как обычно
+
+    // Автоматическое создание контрагента ЗАПРЕЩЕНО по умолчанию — 1С
+    // остаётся единственным источником истины для справочника контрагентов.
+    // Бухгалтер должен либо найти существующего вручную (/search-counterparty),
+    // либо создать контрагента сам в 1С и затем нажать "Пересверить с 1С".
+    await addHistory(`Контрагент "${op.counterparty || op.bin}" (БИН ${op.bin}) не найден в 1С — создайте его вручную в справочнике 1С, затем нажмите «Пересверить с 1С»`, '—');
+    return res.status(409).json({
+      error: 'Автоматическое создание контрагента отключено. Убедитесь через поиск, что его точно нет в 1С, затем создайте контрагента вручную в справочнике 1С и нажмите «Пересверить с 1С».',
+      needsManualCreation: true,
+      op,
+    });
+  } catch (e) {
+    await addHistory(`Ошибка при проверке контрагента: ${e.message}`, '—');
+    res.status(502).json({ error: 'Не удалось проверить контрагента в 1С: ' + e.message });
+  }
+});
+
+// ---------- создание договора "Без договора" (только по явному действию бухгалтера) ----------
+app.post('/api/operations/:id/create-no-contract', requireAuth, async (req, res) => {
+  const all = await getStore('operations', []);
+  const op = all.find(o => o.id === req.params.id);
+  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
+  if (!op.counterpartyKey) return res.status(400).json({ error: 'У операции ещё не сопоставлен контрагент' });
+
+  const settings = await getStore('settings', {});
+  if (!settings.baseUrl) {
+    return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
+  }
+
+  try {
+    // Перепроверяем прямо перед созданием — вдруг договор уже появился
+    // (например, кто-то создал его в 1С, пока вы смотрели список).
+    const fresh = await resolveSupplierContract(op.counterpartyKey, op.purpose, settings);
+    if (fresh.status === 'matched') {
+      op.contractStatus = 'matched';
+      op.contractKey = fresh.key;
+      op.contractName = fresh.name;
+      await setStore('operations', all);
+      await addHistory(`Договор уже найден в 1С при повторной проверке: ${fresh.name}`, '—');
+      return res.json({ ok: true, op });
+    }
+    if (fresh.status === 'ambiguous') {
+      op.contractStatus = 'ambiguous';
+      op.contractOptions = fresh.options;
+      await setStore('operations', all);
+      return res.status(409).json({ error: 'У контрагента уже появилось несколько договоров — выберите нужный вручную.', op });
+    }
+
+    const created = await createNoContractInOnec(op.counterpartyKey, settings);
+    op.contractStatus = 'matched';
+    op.contractKey = created.Ref_Key;
+    op.contractName = created.Description || NO_CONTRACT_NAME;
     await setStore('operations', all);
-    await addHistory(`Создан контрагент в 1С: ${name || op.counterparty} (БИН ${op.bin})`, '—');
+    await addHistory(`Создан договор «Без договора» для контрагента: ${op.counterparty || op.counterpartyMatchedName}`, '—');
     res.json({ ok: true, op });
   } catch (e) {
-    await addHistory(`Ошибка при создании контрагента: ${e.message}`, '—');
-    res.status(502).json({ error: 'Не удалось создать контрагента в 1С: ' + e.message });
+    await addHistory(`Ошибка при создании договора «Без договора»: ${e.message}`, '—');
+    res.status(502).json({ error: 'Не удалось создать договор «Без договора» в 1С: ' + e.message });
   }
 });
 
@@ -1795,13 +1956,15 @@ function extractContractNumber(purpose) {
 // его автоматически. Если несколько — не гадаем, а помечаем операцию как
 // требующую ручного выбора договора. Если в тексте назначения нашёлся
 // номер договора — в первую очередь пытаемся сопоставить именно по нему.
+const CONTRACT_CATALOG_CANDIDATES = ['Catalog_ДоговорыКонтрагентов', 'Catalog_Договоры'];
+const NO_CONTRACT_NAME = 'Без договора';
+
 async function findContractForCounterparty(counterpartyKey, purposeText, settings) {
   if (!counterpartyKey) return { status: 'none' };
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const candidates = ['Catalog_ДоговорыКонтрагентов', 'Catalog_Договоры'];
 
-  for (const catalog of candidates) {
+  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
     const filter = encodeURIComponent(`Владелец_Key eq guid'${counterpartyKey}' or Контрагент_Key eq guid'${counterpartyKey}'`);
     const url = `${base}/${catalog}?$format=json&$filter=${filter}&$select=Ref_Key,Description,Number&$top=20`;
     const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
@@ -1827,6 +1990,72 @@ async function findContractForCounterparty(counterpartyKey, purposeText, setting
     return { status: 'ambiguous', options: list.map(d => ({ key: d.Ref_Key, name: d.Description || d.Number })) };
   }
   return { status: 'none' }; // у конфигурации либо нет отдельного справочника договоров, либо название другое
+}
+
+// Ищет договор конкретного контрагента с названием "Без договора" —
+// отдельным точным запросом (не полагаемся только на findContractForCounterparty,
+// т.к. если у контрагента больше одного договора, "Без договора" может
+// потеряться среди неоднозначных вариантов).
+async function findNoContractRecord(counterpartyKey, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
+    const filter = encodeURIComponent(
+      `(Владелец_Key eq guid'${counterpartyKey}' or Контрагент_Key eq guid'${counterpartyKey}') and Description eq '${NO_CONTRACT_NAME}'`
+    );
+    const url = `${base}/${catalog}?$format=json&$filter=${filter}&$select=Ref_Key,Description&$top=1`;
+    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!response.ok) continue;
+    const data = await response.json().catch(() => null);
+    const found = data && data.value && data.value[0];
+    if (found) return { catalog, key: found.Ref_Key, name: found.Description };
+  }
+  return null;
+}
+
+// Полная логика подбора договора для «Оплата поставщику»:
+//   1) если у контрагента найден ровно один договор (или однозначно по
+//      номеру в назначении платежа) — используем его;
+//   2) если договоров несколько и не определить — статус "ambiguous",
+//      выбор за бухгалтером;
+//   3) если договоров нет вообще — отдельно ищем именно "Без договора";
+//   4) если и его нет — не гадаем и не создаём автоматически, а сообщаем,
+//      что нужно создать "Без договора" (кнопкой в кабинете либо вручную в 1С).
+async function resolveSupplierContract(counterpartyKey, purposeText, settings) {
+  if (!counterpartyKey) return { status: 'none' };
+  const primary = await findContractForCounterparty(counterpartyKey, purposeText, settings);
+  if (primary.status === 'matched' || primary.status === 'ambiguous') return primary;
+
+  const noContract = await findNoContractRecord(counterpartyKey, settings);
+  if (noContract) {
+    return { status: 'matched', key: noContract.key, name: noContract.name };
+  }
+  return { status: 'need_create_no_contract' };
+}
+
+// Создаёт в справочнике договоров запись "Без договора" для контрагента.
+// Вызывается ТОЛЬКО по явному действию бухгалтера (кнопка в кабинете) —
+// никогда автоматически при создании черновика документа.
+async function createNoContractInOnec(counterpartyKey, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+
+  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
+    const payload = {
+      Description: NO_CONTRACT_NAME,
+      Владелец_Key: counterpartyKey,
+      Контрагент_Key: counterpartyKey,
+    };
+    const response = await fetch(`${base}/${catalog}?$format=json`, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (response.ok) return response.json().catch(() => ({}));
+    // Пробуем следующий вариант названия справочника, если этот не подошёл
+    // (например, поля Владелец_Key/Контрагент_Key в нём называются иначе).
+  }
+  throw new Error('Не удалось создать договор "Без договора" — проверьте название справочника договоров в вашей конфигурации 1С');
 }
 
 // Ищет статью ДДС в справочнике 1С по точному названию (например,
@@ -1995,32 +2224,44 @@ async function findCounterpartyByBin(bin, settings, name) {
   // точное совпадение по названию; если его нет — смотрим частичные
   // совпадения, и если их больше одного, ЧЕСТНО сообщаем о неоднозначности,
   // а не гадаем.
+  async function fetchByFilter(filter, top) {
+    const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${encodeURIComponent(filter)}&$top=${top}`;
+    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+    if (!response.ok) return null;
+    const data = await response.json().catch(() => null);
+    return (data && data.value) || [];
+  }
+
   async function tryByName() {
     if (!name || name.trim().length < 3) return null;
     const cleanName = name.trim().replace(/'/g, "''");
 
-    // 1. Точное совпадение — самый надёжный вариант
-    const exactFilter = encodeURIComponent(`Description eq '${cleanName}'`);
-    const exactUrl = `${base}/Catalog_Контрагенты?$format=json&$filter=${exactFilter}&$top=2`;
-    const exactResp = await fetch(exactUrl, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (exactResp.ok) {
-      const exactData = await exactResp.json().catch(() => null);
-      const exactList = (exactData && exactData.value) || [];
-      if (exactList.length === 1) return { match: exactList[0] };
-      if (exactList.length > 1) return { ambiguous: true, options: exactList };
+    // 1. Точное совпадение по исходному названию — самый надёжный вариант
+    const exactList = await fetchByFilter(`Description eq '${cleanName}'`, 2);
+    if (exactList && exactList.length === 1) return { match: exactList[0] };
+    if (exactList && exactList.length > 1) return { ambiguous: true, options: exactList };
+
+    // 2. Частичное совпадение по исходному названию
+    const partialList = await fetchByFilter(`substringof('${cleanName}', Description)`, 10);
+    let candidates = partialList || [];
+
+    // 3. Если ничего не нашли — та же попытка, но по "ядру" названия без
+    // организационно-правовой формы (ТОО/ИП/АО/…) и кавычек: банковская
+    // выписка и справочник 1С часто пишут форму по-разному.
+    if (candidates.length === 0) {
+      const normalizedTarget = normalizeCounterpartyName(name);
+      if (normalizedTarget && normalizedTarget.length >= 3) {
+        const wide = await fetchByFilter(`substringof('${normalizedTarget.replace(/'/g, "''")}', Description)`, 15);
+        candidates = (wide || []).filter(o => normalizeCounterpartyName(o.Description) === normalizedTarget);
+        // Если точных совпадений "ядра" не набралось — берём как есть, лучше
+        // честно показать неоднозначность, чем не найти существующего контрагента.
+        if (candidates.length === 0) candidates = wide || [];
+      }
     }
 
-    // 2. Частичное совпадение — смотрим, сколько всего нашлось (до 5, чтобы
-    // не тянуть слишком много), и решаем по количеству.
-    const partialFilter = encodeURIComponent(`substringof('${cleanName}', Description)`);
-    const partialUrl = `${base}/Catalog_Контрагенты?$format=json&$filter=${partialFilter}&$top=5`;
-    const partialResp = await fetch(partialUrl, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!partialResp.ok) return null;
-    const partialData = await partialResp.json().catch(() => null);
-    const partialList = (partialData && partialData.value) || [];
-    if (partialList.length === 0) return null;
-    if (partialList.length === 1) return { match: partialList[0] };
-    return { ambiguous: true, options: partialList };
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return { match: candidates[0] };
+    return { ambiguous: true, options: candidates };
   }
 
   async function resolveByName() {
@@ -2085,36 +2326,6 @@ async function searchCounterpartyByText(query, settings) {
   return (data && data.value) || [];
 }
 
-// Создаёт нового контрагента в справочнике 1С по данным из операции выписки.
-async function createCounterpartyInOnec(op, settings) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-
-  const payload = {
-    Description: op.counterparty || op.bin,
-    Комментарий: 'Создан автоматически · личный кабинет разноски выписок',
-  };
-  // Имя поля с БИН/ИИН берём то, которое реально работает в вашей базе
-  // (определяется при первом поиске контрагента). Если ещё не определено —
-  // используем ИИН как самый частый вариант для казахстанских конфигураций.
-  payload[workingBinField || 'ИИН'] = op.bin;
-
-  const response = await fetch(`${base}/Catalog_Контрагенты?$format=json`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
-  }
-  return response.json().catch(() => ({}));
-}
-
 // =====================================================================
 // Вызов через OData стандартного интерфейса 1С:Фреш — на основе полей,
 // которые реально видны в вашей базе (Date, Number, Организация_Key,
@@ -2170,6 +2381,12 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
     operationKindLiteral = op.historicalOperationKind;
   } else if (resolvedOperationKind) {
     operationKindLiteral = guessOperationKindLiteral(resolvedOperationKind);
+  } else if (op.amount < 0 && (resolvedCategory === 'Расчёты с поставщиками и подрядчиками' || resolvedCategory === 'Расчеты с поставщиками и подрядчиками')) {
+    // Базовый сценарий "Оплата поставщику" (нет ни истории, ни более
+    // специфичного правила вроде аренды/зарплаты/налогов) — ставим вид
+    // операции по умолчанию. Если точное написание в вашей 1С отличается,
+    // это поле безопасно "отвалится" через OPTIONAL_FIELDS ниже.
+    operationKindLiteral = guessOperationKindLiteral('Оплата поставщику');
   }
   if (operationKindLiteral) {
     payload.ВидОперации = operationKindLiteral;
@@ -2178,9 +2395,14 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   // Договор — привязываем, только если найден однозначно. Если у
   // контрагента несколько договоров и непонятно, какой из них — лучше
   // остановиться и попросить вас выбрать вручную, чем угадать неверно.
+  // Если нет ни одного договора, ни "Без договора" — тоже не гадаем и не
+  // создаём автоматически: просто оставляем поле пустым и явно сообщаем
+  // об этом через droppedFields, чтобы бухгалтер создал "Без договора"
+  // кнопкой (/create-no-contract) до или после создания черновика.
   if (op.contractStatus === 'ambiguous') {
     throw new Error('У контрагента несколько договоров, и не удалось определить нужный по назначению платежа — выберите договор вручную перед подтверждением.');
   }
+  const missingNoContract = op.contractStatus === 'need_create_no_contract' && !op.contractKey;
   if (op.contractKey) {
     payload.Договор_Key = op.contractKey;
   }
@@ -2294,6 +2516,7 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   let currentPayload = payload;
   let response = await postDocument(currentPayload);
   const droppedFields = [];
+  if (missingNoContract) droppedFields.push('Договор_Key (нет договора и нет «Без договора» — создайте кнопкой «Без договора» или в 1С)');
   let safetyCounter = 0;
   while (!response.ok && safetyCounter < OPTIONAL_FIELDS.length) {
     safetyCounter++;
