@@ -497,7 +497,7 @@ async function loadOperations(){
     const contractText = contractAmbiguous
       ? '<span style="color:var(--red)">несколько — выбрать вручную</span>'
       : needsNoContract
-        ? '<span style="color:var(--brass);">не найден — <a href="#" onclick="event.preventDefault();event.stopPropagation();createNoContract(\'' + o.id + '\')">создать «Без договора»</a></span>'
+        ? '<span style="color:var(--brass);">не найден — <a href="#" onclick="event.preventDefault();event.stopPropagation();createNoContract(\\''+o.id+'\\')">создать «Без договора»</a></span>'
         : (o.contractName || '—');
     const isExpanded = expandedOps.has(o.id);
     const defaultHint = o.isDefaultOnly ? ' <span style="color:var(--brass);font-size:11px;">(по умолчанию — проверьте)</span>' : '';
