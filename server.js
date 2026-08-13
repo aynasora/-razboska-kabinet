@@ -1496,16 +1496,16 @@ app.post('/api/operations/:id/override', requireAuth, async (req, res) => {
 });
 
 // ---------- подтверждение операции: создать черновик в 1С ----------
-app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
-  const all = await getStore('operations', []);
-  const op = all.find(o => o.id === req.params.id);
-  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
-
-  const settings = await getStore('settings', {});
-  if (!settings.baseUrl) {
-    return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
-  }
-
+// Вся логика "подтвердить операцию" вынесена в отдельную функцию, чтобы
+// ей могли пользоваться и одиночный эндпоинт /confirm, и пакетный
+// /batch-create-documents — без копирования одного и того же кода дважды.
+// Мутирует op и пишет в историю сама; вызывающий код отвечает только за
+// getStore/setStore и формирование HTTP-ответа.
+//
+// Возвращает:
+//   { ok: true,  docNumber, droppedFields }
+//   { ok: false, httpStatus, error }
+async function confirmOperation(op, all, settings, rules) {
   // ПЕРЕПРОВЕРКА С 1С ПРЯМО ПЕРЕД СОЗДАНИЕМ ДОКУМЕНТА. Данные, с которыми
   // сопоставлялась операция, могли устареть с момента загрузки выписки —
   // между загрузкой и подтверждением могло пройти много времени, кто-то
@@ -1520,9 +1520,8 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     const alreadyExists = await checkExistingInOnec(op, settings);
     if (alreadyExists) {
       op.status = 'already_in_1c';
-      await setStore('operations', all);
       await addHistory(`Перепроверка перед подтверждением: в 1С уже есть такой документ — черновик не создаём (${op.counterparty || 'операция'})`, '—');
-      return res.status(409).json({ error: 'В 1С уже есть документ с такой же датой и суммой — черновик не создан, чтобы не задвоить. Операция помечена как «Уже в 1С».', op });
+      return { ok: false, httpStatus: 409, error: 'В 1С уже есть документ с такой же датой и суммой — черновик не создан, чтобы не задвоить. Операция помечена как «Уже в 1С».' };
     }
   } catch (e) {
     // Если сверка технически не удалась (например, база временно недоступна) —
@@ -1556,11 +1555,11 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     }
   }
   if (op.status === 'new_counterparty' || op.status === 'ambiguous_counterparty') {
-    await setStore('operations', all);
-    return res.status(400).json({
+    return {
+      ok: false,
+      httpStatus: 400,
       error: 'Контрагент не сопоставлен с 1С — сначала обработайте это в карточке операции (создайте контрагента или выберите из найденных вариантов).',
-      op,
-    });
+    };
   }
   if (op.counterpartyKey) {
     try {
@@ -1575,7 +1574,20 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
       // Не критично — используем то, что было определено раньше (если было).
     }
     try {
-      const contract = await resolveSupplierContract(op.counterpartyKey, op.purpose, settings);
+      let contract = await resolveSupplierContract(op.counterpartyKey, op.purpose, settings);
+      // Договора нет вообще, и "Без договора" тоже ещё нет — для оплаты
+      // поставщику создаём "Без договора" сразу здесь, автоматически, не
+      // дожидаясь отдельного клика: findNoContractRecord внутри
+      // resolveSupplierContract уже убедился, что его действительно нет.
+      if (contract && contract.status === 'need_create_no_contract') {
+        try {
+          const createdContract = await createNoContractInOnec(op.counterpartyKey, settings);
+          contract = { status: 'matched', key: createdContract.Ref_Key, name: createdContract.Description || NO_CONTRACT_NAME };
+          await addHistory(`Автоматически создан договор «Без договора» для контрагента: ${op.counterparty || op.counterpartyMatchedName || ''}`, '—');
+        } catch (e) {
+          // Не критично — просто оставим договор пустым, ниже это попадёт в droppedFields.
+        }
+      }
       if (contract) {
         op.contractStatus = contract.status;
         if (contract.status === 'matched') {
@@ -1589,20 +1601,18 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
       // Не критично — используем то, что было определено раньше.
     }
   }
-  await setStore('operations', all);
 
   // Статья ДДС обязательна — без неё документ не создаём. Приоритет:
   // ручная правка > история 1С (уже обновлённая на шаге перепроверки выше)
   // > правила > базовая логика (которая всегда что-то определяет, так что
   // пусто может быть, только если что-то совсем не так с данными).
-  const rules = await getStore('rules', []);
   const ruleMatch = applyRules(op, rules);
   const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
   const account = op.manualAccount || op.historicalAccount || ruleMatch.account;
   const operationKind = op.manualOperationKind || op.historicalOperationKind || ruleMatch.operationKind;
   const debtType = op.manualDebtType || op.historicalDebtType || ruleMatch.debtType;
   if (!category) {
-    return res.status(400).json({ error: 'Не определена статья ДДС — поправьте вручную в карточке операции, прежде чем подтверждать.' });
+    return { ok: false, httpStatus: 400, error: 'Не определена статья ДДС — поправьте вручную в карточке операции, прежде чем подтверждать.' };
   }
 
   // Проверка дубликатов НА УРОВНЕ НАШЕГО СПИСКА операций (в дополнение к
@@ -1616,12 +1626,12 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
   const duplicateOf = all.find(o => o.id !== op.id && o.documentCreated && makeFingerprint(o) === fingerprint);
   if (duplicateOf) {
     op.status = 'duplicate';
-    await setStore('operations', all);
     await addHistory(`Пропущено как дубликат уже созданного документа (№${duplicateOf.onecDocNumber || '—'}): ${op.counterparty || 'операция'}`, '—');
-    return res.status(409).json({
+    return {
+      ok: false,
+      httpStatus: 409,
       error: 'Операция с такими же датой, суммой, БИН/ИИН, контрагентом и назначением платежа уже разнесена ранее — черновик не создан, чтобы не задвоить.',
-      op,
-    });
+    };
   }
 
   try {
@@ -1629,7 +1639,6 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     op.status = 'draft_created';
     op.documentCreated = true;
     op.onecDocNumber = result.docNumber || null;
-    await setStore('operations', all);
     // Если какие-то поля (счёт учёта, подотчётник и т.п.) не прижились в вашей
     // конфигурации 1С — черновик всё равно создаётся, но мы честно пишем в
     // историю, что именно не заполнилось, чтобы можно было доглядеть глазами
@@ -1638,11 +1647,75 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
       ? ` · 1С не приняла поля: ${result.droppedFields.join(', ')} — проверьте их вручную в документе`
       : '';
     await addHistory(`Создан черновик в 1С: ${op.counterparty || 'операция'} · ${op.amount} ₸ · статья: ${category}${droppedNote}`, result.docNumber || '—');
-    res.json({ ok: true, op, droppedFields: result.droppedFields || [] });
+    return { ok: true, docNumber: result.docNumber || null, droppedFields: result.droppedFields || [] };
   } catch (e) {
     await addHistory(`Ошибка при создании черновика: ${e.message}`, '—');
-    res.status(502).json({ error: 'Не удалось создать документ в 1С: ' + e.message });
+    return { ok: false, httpStatus: 502, error: 'Не удалось создать документ в 1С: ' + e.message };
   }
+}
+
+app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
+  const all = await getStore('operations', []);
+  const op = all.find(o => o.id === req.params.id);
+  if (!op) return res.status(404).json({ error: 'Операция не найдена' });
+
+  const settings = await getStore('settings', {});
+  if (!settings.baseUrl) {
+    return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
+  }
+  const rules = await getStore('rules', []);
+
+  const result = await confirmOperation(op, all, settings, rules);
+  await setStore('operations', all);
+
+  if (!result.ok) {
+    return res.status(result.httpStatus).json({ error: result.error, op });
+  }
+  res.json({ ok: true, op, droppedFields: result.droppedFields || [] });
+});
+
+// ---------- пакетное создание черновиков документов сразу по нескольким операциям ----------
+app.post('/api/operations/batch-create-documents', requireAuth, async (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'Передайте массив ids операций для пакетного создания' });
+  }
+
+  const settings = await getStore('settings', {});
+  if (!settings.baseUrl) {
+    return res.status(400).json({ error: 'Сначала укажите адрес подключения к 1С в разделе «Настройки»' });
+  }
+
+  const all = await getStore('operations', []);
+  const rules = await getStore('rules', []);
+  const created = [];
+  const errors = [];
+
+  // Обрабатываем ПОСЛЕДОВАТЕЛЬНО, а не все параллельно: во-первых, так
+  // проверка дубликатов внутри confirmOperation корректно видит документы,
+  // уже созданные другими операциями этого же пакета; во-вторых, не
+  // заваливаем 1С множеством одновременных запросов.
+  for (const id of ids) {
+    const op = all.find(o => o.id === id);
+    if (!op) {
+      errors.push({ id, error: 'Операция не найдена' });
+      continue;
+    }
+    if (op.documentCreated) {
+      errors.push({ id, error: 'Документ по этой операции уже был создан ранее', docNumber: op.onecDocNumber || null });
+      continue;
+    }
+    const result = await confirmOperation(op, all, settings, rules);
+    if (result.ok) {
+      created.push({ id, docNumber: result.docNumber, droppedFields: result.droppedFields || [] });
+    } else {
+      errors.push({ id, error: result.error });
+    }
+  }
+
+  await setStore('operations', all);
+  await addHistory(`Пакетное создание документов: ${created.length} создано, ${errors.length} с ошибками из ${ids.length}`, '—');
+  res.json({ created, errors });
 });
 
 // ---------- выбрать контрагента вручную из неоднозначных вариантов ----------
@@ -1746,11 +1819,19 @@ app.post('/api/operations/:id/rematch', requireAuth, async (req, res) => {
 });
 
 // ---------- создание НОВОГО контрагента (отдельное подтверждение) ----------
+// Создание контрагента остаётся строго РУЧНЫМ действием — сервер никогда не
+// создаёт нового контрагента сам во время загрузки выписки или подтверждения
+// документа. Этот эндпоинт срабатывает только по явному клику на кнопку
+// "Создать нового" в карточке операции, и перед созданием ещё раз строго
+// проверяет и по нормализованному БИН/ИИН, и по нормализованному названию —
+// чтобы не задвоить контрагента, который на самом деле уже есть в 1С.
 app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res) => {
   const all = await getStore('operations', []);
   const op = all.find(o => o.id === req.params.id);
   if (!op) return res.status(404).json({ error: 'Операция не найдена' });
-  if (!op.bin) return res.status(400).json({ error: 'У операции не указан БИН/ИИН — сопоставьте контрагента вручную' });
+  if (!op.bin && !op.counterparty) {
+    return res.status(400).json({ error: 'У операции нет ни БИН/ИИН, ни названия — нечего создавать. Сопоставьте контрагента вручную.' });
+  }
 
   const settings = await getStore('settings', {});
   if (!settings.baseUrl) {
@@ -1758,32 +1839,30 @@ app.post('/api/operations/:id/create-counterparty', requireAuth, async (req, res
   }
 
   try {
-    // На всякий случай проверяем ещё раз прямо перед тем, как отвечать —
-    // вдруг контрагент уже появился в 1С (например, кто-то создал его
-    // вручную, или его нашли через ручной поиск /search-counterparty).
+    // Строгая повторная проверка прямо перед созданием — по нормализованному
+    // БИН/ИИН (только цифры) и по нормализованному названию (без ТОО/ЖШС/ИП
+    // и кавычек, см. normalizeCounterpartyName) — вдруг контрагент уже есть,
+    // просто под слегка другим написанием.
     const existing = await findCounterpartyByBin(op.bin, settings, op.counterparty);
     if (existing) {
       op.counterpartyKey = existing.Ref_Key;
       op.counterpartyMatchedName = existing.Description;
-      op.status = 'review'; // теперь контрагент есть — можно подтверждать документ как обычно
+      op.status = 'review'; // контрагент есть — можно подтверждать документ как обычно
       await setStore('operations', all);
-      await addHistory(`Контрагент найден в 1С при повторной проверке: ${existing.Description} (БИН ${op.bin})`, '—');
-      return res.json({ ok: true, op });
+      await addHistory(`Контрагент найден в 1С при повторной проверке: ${existing.Description} (БИН ${op.bin || '—'})`, '—');
+      return res.json({ ok: true, op, created: false });
     }
 
-    // Автоматическое создание контрагента ЗАПРЕЩЕНО по умолчанию — 1С
-    // остаётся единственным источником истины для справочника контрагентов.
-    // Бухгалтер должен либо найти существующего вручную (/search-counterparty),
-    // либо создать контрагента сам в 1С и затем нажать "Пересверить с 1С".
-    await addHistory(`Контрагент "${op.counterparty || op.bin}" (БИН ${op.bin}) не найден в 1С — создайте его вручную в справочнике 1С, затем нажмите «Пересверить с 1С»`, '—');
-    return res.status(409).json({
-      error: 'Автоматическое создание контрагента отключено. Убедитесь через поиск, что его точно нет в 1С, затем создайте контрагента вручную в справочнике 1С и нажмите «Пересверить с 1С».',
-      needsManualCreation: true,
-      op,
-    });
+    const createdRecord = await createCounterpartyInOnec(op, settings);
+    op.counterpartyKey = createdRecord.Ref_Key;
+    op.counterpartyMatchedName = createdRecord.Description || op.counterparty || '';
+    op.status = 'review';
+    await setStore('operations', all);
+    await addHistory(`Создан новый контрагент в 1С: ${op.counterpartyMatchedName} (БИН ${op.bin || '—'})`, '—');
+    res.json({ ok: true, op, created: true });
   } catch (e) {
-    await addHistory(`Ошибка при проверке контрагента: ${e.message}`, '—');
-    res.status(502).json({ error: 'Не удалось проверить контрагента в 1С: ' + e.message });
+    await addHistory(`Ошибка при создании контрагента: ${e.message}`, '—');
+    res.status(502).json({ error: 'Не удалось создать контрагента в 1С: ' + e.message });
   }
 });
 
@@ -2143,6 +2222,36 @@ async function createNoContractInOnec(counterpartyKey, settings) {
     }
   }
   throw new Error('Не удалось создать договор "Без договора" — проверьте название справочника договоров и поля владельца в вашей конфигурации 1С');
+}
+
+// Создаёт нового контрагента в справочнике 1С. Вызывается ТОЛЬКО по явному
+// клику бухгалтера на кнопку "Создать нового" — эндпоинт перед вызовом этой
+// функции всегда сначала перепроверяет по нормализованному БИН/ИИН и
+// названию, что контрагента точно ещё нет.
+async function createCounterpartyInOnec(op, settings) {
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const normalizedBin = String(op.bin || '').replace(/\D/g, '');
+  const description = String(op.counterparty || normalizedBin || 'Без названия').trim();
+
+  // Имя поля с БИН/ИИН берём то, которое реально работает в вашей базе
+  // (определяется при поиске контрагента) — если ещё не определено,
+  // используем ИИН как самый частый вариант для казахстанских конфигураций.
+  const binField = workingBinField || 'ИИН';
+  const payload = { Description: description };
+  if (normalizedBin) payload[binField] = normalizedBin;
+  console.log(`[createCounterpartyInOnec] создаю контрагента: "${description}", ${binField}="${normalizedBin}"`);
+
+  const response = await fetch(`${base}/Catalog_Контрагенты?$format=json`, {
+    method: 'POST',
+    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
+  }
+  return response.json().catch(() => ({}));
 }
 
 // Ищет статью ДДС в справочнике 1С по точному названию (например,
