@@ -448,6 +448,7 @@ async function loadOperations(){
     if(o.contractStatus==='ambiguous') return 0;
     if(o.status==='review') return 1;
     if(o.status==='already_in_1c') return 2;
+    if(o.status==='duplicate') return 2;
     if(o.status==='draft_created') return 3;
     return 1;
   };
@@ -458,6 +459,7 @@ async function loadOperations(){
     const done = o.status==='draft_created';
     const isNew = o.status==='new_counterparty';
     const already = o.status==='already_in_1c';
+    const isDuplicate = o.status==='duplicate';
     const hasCategory = !!o.suggestedCategory;
     const contractAmbiguous = o.contractStatus === 'ambiguous';
     const needsNoContract = o.contractStatus === 'need_create_no_contract' && !o.contractKey;
@@ -466,7 +468,7 @@ async function loadOperations(){
     // но статус остался обычным "review". Без реального Ref_Key
     // контрагента документ в 1С создать нельзя — блокируем и предлагаем
     // пересверить.
-    const missingCounterparty = !done && !already && !isNew && !o.counterpartyKey && o.status !== 'ambiguous_counterparty';
+    const missingCounterparty = !done && !already && !isDuplicate && !isNew && !o.counterpartyKey && o.status !== 'ambiguous_counterparty';
     const ambiguousCounterparty = o.status === 'ambiguous_counterparty';
     let statusHtml, actionHtml;
     if(done){
@@ -475,6 +477,9 @@ async function loadOperations(){
     } else if(already){
       statusHtml = '<span class="pill pill-review" style="background:var(--paper-2);color:var(--muted);">Уже в 1С</span>';
       actionHtml = '';
+    } else if(isDuplicate){
+      statusHtml = '<span class="pill pill-review" style="background:var(--paper-2);color:var(--muted);">Дубликат</span>';
+      actionHtml = '<span style="font-size:11px;color:var(--muted);">похоже, уже разнесено — см. историю</span>';
     } else if(isNew){
       statusHtml = '<span class="pill pill-new">Новый контрагент</span>';
       actionHtml = '<span style="font-size:11px;color:var(--muted);">проверьте ниже ↓</span>';
@@ -984,6 +989,22 @@ function normalizeCounterpartyName(name) {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+// "Отпечаток" операции — используется, чтобы не создать в 1С второй
+// одинаковый документ, если одна и та же выписка (или пересекающийся
+// период) была загружена дважды и попала в список операций как два разных
+// объекта (с разными id). Берём только день из даты (без времени), сумму
+// без знака (направление уже видно по документу), БИН/ИИН только цифрами
+// и "ядро" названия контрагента — так же, как две почти одинаковые строки
+// из разных выгрузок банка распознаются как одна и та же операция.
+function makeFingerprint(op) {
+  const day = String(op.date || '').trim().split(' ')[0];
+  const amount = Math.abs(Number(op.amount) || 0).toFixed(2);
+  const binDigits = String(op.bin || '').replace(/\D/g, '');
+  const normName = normalizeCounterpartyName(op.counterparty);
+  const purpose = String(op.purpose || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return `${day}|${amount}|${binDigits}|${normName}|${purpose}`;
+}
+
 // Правило может проверять назначение платежа, имя контрагента ИЛИ КНП
 // (код назначения платежа — стандартный классификатор, который банки РК
 // присылают прямо в выписке). normalizeRuleField приводит любое сырое
@@ -1302,10 +1323,12 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
 
   // Не добавляем операцию повторно, если такая же (по дате, сумме, БИН и
   // назначению) уже есть в списке — иначе повторная загрузка того же файла
-  // задваивает список.
-  const dedupKey = (o) => `${o.date}|${o.amount}|${o.bin}|${o.purpose}`;
-  const existingKeys = new Set(all.map(dedupKey));
-  const newOnly = operations.filter(op => !existingKeys.has(dedupKey(op)));
+  // (или пересекающийся период в другом файле) задваивает список. Сравниваем
+  // по "отпечатку" — он сглаживает мелкие различия в написании БИН/названия
+  // между разными выгрузками одного и того же банка.
+  operations.forEach(op => { op.fingerprint = makeFingerprint(op); });
+  const existingFingerprints = new Set(all.map(o => o.fingerprint || makeFingerprint(o)));
+  const newOnly = operations.filter(op => !existingFingerprints.has(op.fingerprint));
   const skippedDuplicates = operations.length - newOnly.length;
 
   const updated = [...all, ...newOnly];
@@ -1582,9 +1605,29 @@ app.post('/api/operations/:id/confirm', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Не определена статья ДДС — поправьте вручную в карточке операции, прежде чем подтверждать.' });
   }
 
+  // Проверка дубликатов НА УРОВНЕ НАШЕГО СПИСКА операций (в дополнение к
+  // проверке 1С выше в шаге 1): если среди уже загруженных операций есть
+  // другая, с таким же отпечатком (дата+сумма+БИН+контрагент+назначение), и
+  // по ней документ УЖЕ был создан — значит, эта операция, скорее всего,
+  // попала в список второй раз (например, из пересекающегося периода двух
+  // выгрузок) и создавать по ней ещё один черновик не нужно.
+  const fingerprint = makeFingerprint(op);
+  op.fingerprint = fingerprint;
+  const duplicateOf = all.find(o => o.id !== op.id && o.documentCreated && makeFingerprint(o) === fingerprint);
+  if (duplicateOf) {
+    op.status = 'duplicate';
+    await setStore('operations', all);
+    await addHistory(`Пропущено как дубликат уже созданного документа (№${duplicateOf.onecDocNumber || '—'}): ${op.counterparty || 'операция'}`, '—');
+    return res.status(409).json({
+      error: 'Операция с такими же датой, суммой, БИН/ИИН, контрагентом и назначением платежа уже разнесена ранее — черновик не создан, чтобы не задвоить.',
+      op,
+    });
+  }
+
   try {
     const result = await createDraftInOnec(op, settings, category, account, operationKind, debtType);
     op.status = 'draft_created';
+    op.documentCreated = true;
     op.onecDocNumber = result.docNumber || null;
     await setStore('operations', all);
     // Если какие-то поля (счёт учёта, подотчётник и т.п.) не прижились в вашей
@@ -1959,37 +2002,75 @@ function extractContractNumber(purpose) {
 const CONTRACT_CATALOG_CANDIDATES = ['Catalog_ДоговорыКонтрагентов', 'Catalog_Договоры'];
 const NO_CONTRACT_NAME = 'Без договора';
 
-async function findContractForCounterparty(counterpartyKey, purposeText, settings) {
-  if (!counterpartyKey) return { status: 'none' };
+// Имя поля-владельца в справочнике договоров тоже отличается между
+// конфигурациями (Владелец_Key vs Контрагент_Key). Раньше оба поля
+// проверялись ОДНИМ запросом через "or" — но если хотя бы одного из двух
+// полей нет в конкретном справочнике, OData 1С отклоняет весь запрос
+// целиком (ошибка парсинга фильтра), и мы тихо теряли договор, который на
+// самом деле есть. Теперь, как и с БИН/ИИН, пробуем поля ПО ОДНОМУ и
+// запоминаем рабочую комбинацию "справочник + поле".
+const CONTRACT_OWNER_FIELD_CANDIDATES = ['Владелец_Key', 'Контрагент_Key'];
+let workingContractCatalog = null;
+let workingContractOwnerField = null;
+
+async function fetchContractsByOwner(counterpartyKey, settings, extraFilter) {
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
 
-  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
-    const filter = encodeURIComponent(`Владелец_Key eq guid'${counterpartyKey}' or Контрагент_Key eq guid'${counterpartyKey}'`);
-    const url = `${base}/${catalog}?$format=json&$filter=${filter}&$select=Ref_Key,Description,Number&$top=20`;
+  async function tryCombo(catalog, field) {
+    let filter = `${field} eq guid'${counterpartyKey}'`;
+    if (extraFilter) filter += ` and ${extraFilter}`;
+    const url = `${base}/${catalog}?$format=json&$filter=${encodeURIComponent(filter)}&$select=Ref_Key,Description,Number&$top=20`;
+    console.log(`[findContractForCounterparty] запрос: ${catalog}.${field}${extraFilter ? ' + ' + extraFilter : ''}`);
     const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) continue; // пробуем следующее возможное название справочника
+    if (!response.ok) return null; // это поле/справочник не подошли — пробуем другую комбинацию
     const data = await response.json().catch(() => null);
-    const list = (data && data.value) || [];
-    if (list.length === 0) continue;
+    return data ? (data.value || []) : null;
+  }
 
-    if (list.length === 1) {
-      return { status: 'matched', key: list[0].Ref_Key, name: list[0].Description || list[0].Number };
-    }
-
-    // Несколько договоров — пробуем сопоставить по номеру, найденному в назначении платежа
-    const hint = extractContractNumber(purposeText);
-    if (hint) {
-      const byNumber = list.find(d =>
-        (d.Number && d.Number.includes(hint)) || (d.Description && d.Description.includes(hint))
-      );
-      if (byNumber) {
-        return { status: 'matched', key: byNumber.Ref_Key, name: byNumber.Description || byNumber.Number };
+  if (workingContractCatalog && workingContractOwnerField) {
+    const list = await tryCombo(workingContractCatalog, workingContractOwnerField);
+    if (list !== null) return { catalog: workingContractCatalog, list };
+    workingContractCatalog = null;
+    workingContractOwnerField = null; // рабочая комбинация перестала работать — определим заново
+  }
+  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
+    for (const field of CONTRACT_OWNER_FIELD_CANDIDATES) {
+      const list = await tryCombo(catalog, field);
+      if (list !== null) {
+        workingContractCatalog = catalog;
+        workingContractOwnerField = field;
+        return { catalog, list };
       }
     }
-    return { status: 'ambiguous', options: list.map(d => ({ key: d.Ref_Key, name: d.Description || d.Number })) };
   }
-  return { status: 'none' }; // у конфигурации либо нет отдельного справочника договоров, либо название другое
+  console.log('[findContractForCounterparty] ни одна комбинация справочник+поле не сработала — проверьте название справочника договоров в вашей 1С');
+  return null;
+}
+
+async function findContractForCounterparty(counterpartyKey, purposeText, settings) {
+  if (!counterpartyKey) return { status: 'none' };
+  const result = await fetchContractsByOwner(counterpartyKey, settings);
+  if (!result || result.list.length === 0) return { status: 'none' };
+  const { list } = result;
+
+  if (list.length === 1) {
+    console.log(`[findContractForCounterparty] найден единственный договор: ${list[0].Description || list[0].Number}`);
+    return { status: 'matched', key: list[0].Ref_Key, name: list[0].Description || list[0].Number };
+  }
+
+  // Несколько договоров — пробуем сопоставить по номеру, найденному в назначении платежа
+  const hint = extractContractNumber(purposeText);
+  if (hint) {
+    const byNumber = list.find(d =>
+      (d.Number && d.Number.includes(hint)) || (d.Description && d.Description.includes(hint))
+    );
+    if (byNumber) {
+      return { status: 'matched', key: byNumber.Ref_Key, name: byNumber.Description || byNumber.Number };
+    }
+  }
+  console.log(`[findContractForCounterparty] неоднозначно: найдено ${list.length} договоров`);
+  return { status: 'ambiguous', options: list.map(d => ({ key: d.Ref_Key, name: d.Description || d.Number })) };
 }
 
 // Ищет договор конкретного контрагента с названием "Без договора" —
@@ -1997,19 +2078,13 @@ async function findContractForCounterparty(counterpartyKey, purposeText, setting
 // т.к. если у контрагента больше одного договора, "Без договора" может
 // потеряться среди неоднозначных вариантов).
 async function findNoContractRecord(counterpartyKey, settings) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
-    const filter = encodeURIComponent(
-      `(Владелец_Key eq guid'${counterpartyKey}' or Контрагент_Key eq guid'${counterpartyKey}') and Description eq '${NO_CONTRACT_NAME}'`
-    );
-    const url = `${base}/${catalog}?$format=json&$filter=${filter}&$select=Ref_Key,Description&$top=1`;
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) continue;
-    const data = await response.json().catch(() => null);
-    const found = data && data.value && data.value[0];
-    if (found) return { catalog, key: found.Ref_Key, name: found.Description };
+  const result = await fetchContractsByOwner(counterpartyKey, settings, `Description eq '${NO_CONTRACT_NAME}'`);
+  const found = result && result.list[0];
+  if (found) {
+    console.log(`[findNoContractRecord] найден договор "Без договора": ${found.Ref_Key}`);
+    return { catalog: result.catalog, key: found.Ref_Key, name: found.Description };
   }
+  console.log('[findNoContractRecord] договор "Без договора" не найден для этого контрагента');
   return null;
 }
 
@@ -2040,22 +2115,34 @@ async function createNoContractInOnec(counterpartyKey, settings) {
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
 
-  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
-    const payload = {
-      Description: NO_CONTRACT_NAME,
-      Владелец_Key: counterpartyKey,
-      Контрагент_Key: counterpartyKey,
-    };
+  async function tryPost(catalog, field) {
+    const payload = { Description: NO_CONTRACT_NAME, [field]: counterpartyKey };
+    console.log(`[createNoContractInOnec] создаю "${NO_CONTRACT_NAME}" в ${catalog}.${field}`);
     const response = await fetch(`${base}/${catalog}?$format=json`, {
       method: 'POST',
       headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (response.ok) return response.json().catch(() => ({}));
-    // Пробуем следующий вариант названия справочника, если этот не подошёл
-    // (например, поля Владелец_Key/Контрагент_Key в нём называются иначе).
+    if (!response.ok) return null;
+    return response.json().catch(() => ({}));
   }
-  throw new Error('Не удалось создать договор "Без договора" — проверьте название справочника договоров в вашей конфигурации 1С');
+
+  // Если уже знаем рабочую комбинацию справочник+поле — используем её сразу.
+  if (workingContractCatalog && workingContractOwnerField) {
+    const created = await tryPost(workingContractCatalog, workingContractOwnerField);
+    if (created) return created;
+  }
+  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
+    for (const field of CONTRACT_OWNER_FIELD_CANDIDATES) {
+      const created = await tryPost(catalog, field);
+      if (created) {
+        workingContractCatalog = catalog;
+        workingContractOwnerField = field;
+        return created;
+      }
+    }
+  }
+  throw new Error('Не удалось создать договор "Без договора" — проверьте название справочника договоров и поля владельца в вашей конфигурации 1С');
 }
 
 // Ищет статью ДДС в справочнике 1С по точному названию (например,
@@ -2066,15 +2153,38 @@ async function findCategoryKeyByName(name, settings) {
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
   const candidates = ['Catalog_СтатьиДвиженияДенежныхСредств', 'Catalog_СтатьиДДС'];
-  const filter = encodeURIComponent(`Description eq '${String(name).replace(/'/g, "''")}'`);
-  for (const catalog of candidates) {
-    const url = `${base}/${catalog}?$format=json&$filter=${filter}&$select=Ref_Key&$top=1`;
+  const cleanName = String(name).trim().replace(/'/g, "''");
+  console.log(`[findCategoryKeyByName] ищу статью ДДС: "${name}"`);
+
+  async function tryUrl(url) {
     const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) continue;
+    if (!response.ok) return null;
     const data = await response.json().catch(() => null);
-    const item = data && data.value && data.value[0];
-    if (item) return item.Ref_Key;
+    return (data && data.value) || [];
   }
+
+  for (const catalog of candidates) {
+    // 1. Точное совпадение по названию (самый надёжный вариант)
+    const exactUrl = `${base}/${catalog}?$format=json&$filter=${encodeURIComponent(`Description eq '${cleanName}'`)}&$select=Ref_Key,Description&$top=1`;
+    let list = await tryUrl(exactUrl);
+    if (list === null) continue; // этого справочника нет под таким именем — пробуем следующий
+    if (list.length) {
+      console.log(`[findCategoryKeyByName] найдено точным совпадением в ${catalog}: ${list[0].Description}`);
+      return list[0].Ref_Key;
+    }
+
+    // 2. Точное совпадение иногда не срабатывает из-за разного написания
+    // "е"/"ё" ("Расчеты"/"Расчёты") или лишних пробелов — пробуем частичное
+    // совпадение по буквам без "ё", это покрывает оба варианта написания.
+    const looseName = cleanName.replace(/ё/gi, m => (m === 'ё' ? 'е' : 'Е'));
+    const looseUrl = `${base}/${catalog}?$format=json&$filter=${encodeURIComponent(`substringof('${looseName}', Description)`)}&$select=Ref_Key,Description&$top=3`;
+    list = await tryUrl(looseUrl);
+    if (list && list.length) {
+      console.log(`[findCategoryKeyByName] найдено частичным совпадением в ${catalog}: ${list[0].Description}`);
+      return list[0].Ref_Key;
+    }
+  }
+  console.log(`[findCategoryKeyByName] статья ДДС "${name}" не найдена ни в одном справочнике-кандидате`);
   return null;
 }
 
@@ -2206,14 +2316,23 @@ async function findCounterpartyByBin(bin, settings, name) {
   const base = settings.baseUrl.replace(/\/+$/, '');
   const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
 
+  // БИН/ИИН из выписки иногда приходит с пробелами, апострофами или
+  // текстовым форматированием Excel ("123 456 789 012", "'123456789012") —
+  // а в справочнике 1С хранится как чистая строка цифр. Сравнение "как есть"
+  // в таких случаях просто не находит существующего контрагента.
+  const normalizedBin = String(bin || '').replace(/\D/g, '');
+  console.log(`[findCounterpartyByBin] ищу контрагента: БИН/ИИН="${bin}" -> "${normalizedBin}", название="${name || ''}"`);
+
   async function tryField(field) {
-    const filter = encodeURIComponent(`${field} eq '${bin}'`);
+    const filter = encodeURIComponent(`${field} eq '${normalizedBin}'`);
     const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}&$top=1`;
     const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
     if (!response.ok) return { fieldExists: false };
     const data = await response.json().catch(() => null);
     if (!data) return { fieldExists: false };
-    return { fieldExists: true, found: (data.value || [])[0] || null };
+    const found = (data.value || [])[0] || null;
+    console.log(`[findCounterpartyByBin] поле ${field}: ${found ? 'найден ' + found.Description : 'не найден'}`);
+    return { fieldExists: true, found };
   }
 
   // Запасной поиск по названию — на случай, если БИН в выписке не
@@ -2280,7 +2399,7 @@ async function findCounterpartyByBin(bin, settings, name) {
   }
 
   // Если рабочее поле уже определено — сразу используем его.
-  if (workingBinField && bin) {
+  if (workingBinField && normalizedBin) {
     const r = await tryField(workingBinField);
     if (r.fieldExists) {
       if (r.found) return r.found;
@@ -2289,7 +2408,7 @@ async function findCounterpartyByBin(bin, settings, name) {
     workingBinField = null; // поле перестало работать — определим заново
   }
 
-  if (!bin) return await resolveByName(); // БИН в выписке пуст — сразу по названию
+  if (!normalizedBin) return await resolveByName(); // БИН в выписке пуст — сразу по названию
 
   const errors = [];
   for (const field of BIN_FIELD_CANDIDATES) {
