@@ -897,6 +897,7 @@ const DEFAULT_RULES = [
   { field: 'purpose', contains: 'опвр', category: 'Налоги', account: '3150' },
   { field: 'purpose', contains: 'комисси', category: 'Банковские услуги', account: '3310/1710' },
   { field: 'purpose', contains: 'возврат', category: 'Возврат денежных средств', account: '3310/1710' },
+  { field: 'counterparty', contains: 'Смаил', category: 'Выдача в подотчет', account: '1251', operationKind: 'Перечисление денежных средств подотчетнику', debtType: 'Оплата поставщикам' },
 ];
 
 // Дата у нас хранится как ДД.ММ.ГГГГ (как в банковской выписке), а OData
@@ -2569,6 +2570,23 @@ async function searchCounterpartyByText(query, settings) {
 // раз узнать (через тот же OData: .../Catalog_Организации?$format=json)
 // и вписать в настройки — без них документ не создать.
 // =====================================================================
+
+// "Подотчётник" в документе "Перечисление денежных средств подотчётнику" —
+// это ссылка на элемент справочника ФИЗИЧЕСКИХ ЛИЦ (Catalog_ФизическиеЛица),
+// а НЕ на контрагента (Catalog_Контрагенты). У них разные Ref_Key, даже если
+// это один и тот же человек и имя совпадает — поэтому ищем отдельно, по ФИО.
+async function findIndividualKeyByName(name, settings) {
+  if (!name) return null;
+  const base = settings.baseUrl.replace(/\/+$/, '');
+  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
+  const cleanName = String(name).trim().replace(/'/g, "''");
+  const url = `${base}/Catalog_ФизическиеЛица?$format=json&$filter=${encodeURIComponent(`Description eq '${cleanName}'`)}&$select=Ref_Key&$top=1`;
+  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+  if (!response.ok) return null;
+  const data = await response.json().catch(() => null);
+  return (data && data.value && data.value[0] && data.value[0].Ref_Key) || null;
+}
+
 async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount, resolvedOperationKind, resolvedDebtType) {
   const base = settings.baseUrl.replace(/\/+$/, ''); // убираем лишний / на конце
   const docType = op.amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
@@ -2678,8 +2696,12 @@ async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount
   const isAccountablePersonPayment = /подотчет/i.test(
     String(resolvedOperationKind || '') + ' ' + String(op.historicalOperationKind || '')
   );
-  if (isAccountablePersonPayment && op.counterpartyKey) {
-    lineItem.Подотчетник_Key = op.counterpartyKey;
+  if (isAccountablePersonPayment) {
+    // Подотчётник — физлицо, а не контрагент: Ref_Key контрагента сюда
+    // не подходит, даже если это тот же человек. Ищем в справочнике
+    // физических лиц по ФИО.
+    const individualKey = await findIndividualKeyByName(op.counterparty, settings);
+    if (individualKey) lineItem.Подотчетник_Key = individualKey;
   }
 
   payload.РасшифровкаПлатежа = [lineItem];
