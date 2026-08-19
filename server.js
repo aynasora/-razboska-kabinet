@@ -37,6 +37,25 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// ---------- модули обработки банковской выписки (lib/) ----------
+// Перенесены из этого файла как отдельный первый этап рефакторинга — сама
+// бизнес-логика не менялась, только перемещена и (где было продублировано)
+// объединена в одну функцию. См. lib/*.js — там же комментарии о том, что
+// именно перенесено, а что добавлено новое (dryRun, verifyCreatedDocument).
+const { fixKazakhMojibake, normalizeCounterpartyName, toIsoDate } = require('./lib/shared');
+const { DEFAULT_RULES, normalizeRuleField, applyRules } = require('./lib/rules');
+const { classifyOperation } = require('./lib/classifyOperation');
+const bankParser = require('./lib/bankParser');
+const { findCounterpartyByBin, searchCounterpartyByText, createCounterpartyInOnec } = require('./lib/resolveCounterparty');
+const { resolveSupplierContract, createNoContractInOnec, NO_CONTRACT_NAME } = require('./lib/resolveContract');
+const { findHistoricalCategory } = require('./lib/resolveCashFlowArticle');
+const { makeFingerprint, checkExistingInOnec, findDuplicateAmongOperations } = require('./lib/duplicateGuard');
+const { buildPayload } = require('./lib/buildPayload');
+const { writeTo1C } = require('./lib/writeTo1C');
+const { dryRun } = require('./lib/dryRun');
+const { verifyCreatedDocument } = require('./lib/verifyCreatedDocument');
+const { reconcileStatement } = require('./lib/reconcileStatement');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
@@ -884,169 +903,6 @@ async function setStore(key, value) {
   writeJsonFile(key + '.json', value);
 }
 
-// Типовые правила по регламенту («Правила ИИ-помощника 1С — Банк / ДДС / расчёты»).
-// Создаются один раз, если у вас ещё нет ни одного правила — дальше вы можете
-// их редактировать или удалять как обычные правила в разделе «Правила».
-const DEFAULT_RULES = [
-  { field: 'purpose', contains: 'аренд', category: 'Аренда', account: '3360/1710' },
-  { field: 'purpose', contains: 'зарплат', category: 'Заработная плата', account: '3350' },
-  { field: 'purpose', contains: 'налог', category: 'Налоги', account: '3130' },
-  { field: 'purpose', contains: 'кпн', category: 'Налоги', account: '3130' },
-  { field: 'purpose', contains: 'ипн', category: 'Налоги', account: '3120' },
-  { field: 'purpose', contains: 'осмс', category: 'Налоги', account: '3150' },
-  { field: 'purpose', contains: 'опвр', category: 'Налоги', account: '3150' },
-  { field: 'purpose', contains: 'комисси', category: 'Банковские услуги', account: '3310/1710' },
-  { field: 'purpose', contains: 'возврат', category: 'Возврат денежных средств', account: '3310/1710' },
-  { field: 'counterparty', contains: 'Смаил', category: 'Выдача в подотчет', account: '1251', operationKind: 'Перечисление денежных средств подотчетнику', debtType: 'Оплата поставщикам' },
-];
-
-// Дата у нас хранится как ДД.ММ.ГГГГ (как в банковской выписке), а OData
-// в 1С ожидает международный формат ГГГГ-ММ-ДДTчч:мм:сс — переводим перед
-// отправкой в 1С, иначе она отвечает «Не удалось разобрать строку как
-// значение типа Edm.DateTime».
-function toIsoDate(dateStr) {
-  const parts = String(dateStr).split('.');
-  if (parts.length !== 3) return dateStr; // уже похоже на другой формат — не трогаем
-  const [day, month, year] = parts;
-  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T00:00:00`;
-}
-
-// Точные внутренние имена для "Вида операции" — 1С хранит их слитно,
-// без пробелов, с заглавной буквы у каждого слова, а не так, как
-// показывает на экране. Подтверждённые значения (проверены напрямую
-// через OData на вашей базе) — самые надёжные. Для остальных пунктов
-// того же списка используется тот же принцип именования как обоснованная
-// попытка — если она окажется неверной, при создании документа мы просто
-// не отправим это поле, а не провалим создание черновика целиком.
-const CONFIRMED_OPERATION_KINDS = {
-  'перечисление денежных средств подотчетнику': 'ПеречислениеДенежныхСредствПодотчетнику',
-};
-function guessOperationKindLiteral(text) {
-  const normalized = String(text || '').toLowerCase().trim();
-  if (CONFIRMED_OPERATION_KINDS[normalized]) return CONFIRMED_OPERATION_KINDS[normalized];
-  if (!text) return null;
-  // Обоснованная попытка: каждое слово с заглавной буквы, слитно, без
-  // знаков препинания — так называет свои перечисления 1С в этом списке.
-  return String(text)
-    .split(/[\s.,]+/)
-    .filter(Boolean)
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join('');
-}
-
-function baseDefault(amount) {
-  return amount >= 0
-    ? { category: 'Реализация работ и услуг', account: '1210/3510' }
-    : { category: 'Расчёты с поставщиками и подрядчиками', account: '3310/1710' };
-}
-
-// Некоторые латинские и кириллические буквы визуально неотличимы (a/а,
-// e/е, o/о, p/р, c/с, x/х, y/у, k/к, h/н, m/м, t/т, b/в и т.д.). Если при
-// вводе текста (в правиле или в самой банковской выписке) закралась "не
-// та" буква — обычное сравнение строк не находит совпадение, хотя
-// глазами всё выглядит одинаково. Эта функция приводит все похожие
-// буквы к одному (кириллическому) варианту перед сравнением.
-const SCRIPT_NORMALIZE_MAP = {
-  a: 'а', e: 'е', o: 'о', p: 'р', c: 'с', x: 'х', y: 'у', k: 'к', h: 'н', m: 'м', t: 'т', b: 'в', i: 'і',
-  A: 'А', E: 'Е', O: 'О', P: 'Р', C: 'С', X: 'Х', Y: 'У', K: 'К', H: 'Н', M: 'М', T: 'Т', B: 'В', I: 'І',
-};
-function normalizeScript(s) {
-  return String(s || '').split('').map(ch => SCRIPT_NORMALIZE_MAP[ch] || ch).join('');
-}
-
-// Некоторые банки (замечено на выгрузках .xls БЦК / БЦК Бизнес) до сих пор
-// используют старую до-юникодную казахскую кодировку для казахских букв: в
-// тексте вместо Ә/ә стоит македонская/сербская Ј/ј, а вместо Қ/қ — Ќ/ќ.
-// В Excel это выглядит почти неотличимо от нормального написания, но байты
-// другие — из-за этого сопоставление контрагента по имени не находит уже
-// существующую в 1С запись с правильным написанием и создаёт дубль с
-// испорченным именем. Эти четыре символа не встречаются в казахском/русском
-// тексте ни в каком легитимном случае, поэтому исправляем их без риска
-// испортить что-то другое. Если найдутся другие письма с похожей порчей
-// других казахских букв — карту можно будет расширить.
-const KAZAKH_MOJIBAKE_MAP = { 'Ј': 'Ә', 'ј': 'ә', 'Ќ': 'Қ', 'ќ': 'қ' };
-function fixKazakhMojibake(s) {
-  const str = String(s || '');
-  let hasMojibake = false;
-  for (const ch of str) {
-    if (KAZAKH_MOJIBAKE_MAP[ch]) { hasMojibake = true; break; }
-  }
-  if (!hasMojibake) return str;
-  return str.split('').map(ch => KAZAKH_MOJIBAKE_MAP[ch] || ch).join('');
-}
-
-// Организационно-правовая форма (ТОО/ИП/АО и т.п.) и кавычки часто пишутся
-// по-разному в банковской выписке и в справочнике 1С ("ТОО Ромашка" vs
-// "Ромашка" vs "\"Ромашка\" ТОО") — из-за этого поиск по точному названию
-// не находит контрагента, который на самом деле уже есть. normalizeCounterpartyName
-// убирает эти различия, оставляя только "ядро" названия для сравнения.
-const LEGAL_FORM_WORDS = ['тоо', 'жшс', 'ип', 'ао', 'оао', 'зао', 'чуп', 'гу', 'пк', 'кх', 'офз', 'фх', 'нао'];
-function normalizeCounterpartyName(name) {
-  let s = String(name || '').toLowerCase();
-  s = s.replace(/["'«»„“”`]/g, ' ');
-  for (const word of LEGAL_FORM_WORDS) {
-    s = s.replace(new RegExp(`(^|\\s)${word}(\\s|$)`, 'g'), ' ');
-  }
-  return s.replace(/\s+/g, ' ').trim();
-}
-
-// "Отпечаток" операции — используется, чтобы не создать в 1С второй
-// одинаковый документ, если одна и та же выписка (или пересекающийся
-// период) была загружена дважды и попала в список операций как два разных
-// объекта (с разными id). Берём только день из даты (без времени), сумму
-// без знака (направление уже видно по документу), БИН/ИИН только цифрами
-// и "ядро" названия контрагента — так же, как две почти одинаковые строки
-// из разных выгрузок банка распознаются как одна и та же операция.
-function makeFingerprint(op) {
-  const day = String(op.date || '').trim().split(' ')[0];
-  const amount = Math.abs(Number(op.amount) || 0).toFixed(2);
-  const binDigits = String(op.bin || '').replace(/\D/g, '');
-  const normName = normalizeCounterpartyName(op.counterparty);
-  const purpose = String(op.purpose || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  return `${day}|${amount}|${binDigits}|${normName}|${purpose}`;
-}
-
-// Правило может проверять назначение платежа, имя контрагента ИЛИ КНП
-// (код назначения платежа — стандартный классификатор, который банки РК
-// присылают прямо в выписке). normalizeRuleField приводит любое сырое
-// значение поля (из формы, bulk-импорта, RULES_TEXT) к одному из трёх
-// допустимых значений.
-function normalizeRuleField(raw) {
-  if (raw === 'counterparty') return 'counterparty';
-  if (raw === 'knp') return 'knp';
-  return 'purpose';
-}
-function ruleFieldValue(op, field) {
-  if (field === 'counterparty') return op.counterparty;
-  if (field === 'knp') return op.knp;
-  return op.purpose;
-}
-
-// Применяет ваши правила категоризации к операции: смотрит назначение
-// платежа, имя контрагента и/или КНП, и если находит совпадение —
-// возвращает категорию и счёт. Правила проверяются по порядку, первое
-// совпадение побеждает. Если ни одно правило не подошло — возвращает
-// базовую логику «покупатель/поставщик» по регламенту, а не пустоту:
-// минимум статья по направлению платежа должна быть определена всегда.
-function applyRules(op, rules) {
-  for (const rule of rules) {
-    const raw = ruleFieldValue(op, rule.field) || '';
-    const haystack = normalizeScript(raw).toLowerCase();
-    const needle = normalizeScript(String(rule.contains || '')).toLowerCase();
-    if (needle && haystack.includes(needle)) {
-      return {
-        category: rule.category || '',
-        account: rule.account || '',
-        operationKind: rule.operationKind || '',
-        debtType: rule.debtType || '',
-        source: 'rule',
-      };
-    }
-  }
-  const base = baseDefault(op.amount);
-  return { ...base, operationKind: '', debtType: '', source: 'default' };
-}
-
 // ---------- вход по паролю (сессия — подписанный токен, без хранения на сервере) ----------
 // Раньше токен сессии хранился в Map в памяти процесса — при каждом передеплое на
 // Render процесс пересоздаётся, Map становится пустой, и все уже вошедшие
@@ -1206,127 +1062,23 @@ app.post('/api/settings/browse', requireAuth, async (req, res) => {
 app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Файл не получен' });
 
-  let grid;
-  let workbook;
+  // 1. bankParser: xlsx → единый объект операции (см. lib/bankParser.js),
+  // не зависящий от того, какой это банк и как называются его колонки.
+  let operations, parseFormat;
   try {
-    workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    // header:1 → читаем как массив строк-массивов, без угадывания заголовков —
-    // многие банковские выписки (например БЦК/Kaspi) кладут перед таблицей
-    // несколько строк с реквизитами банка, поэтому настоящую шапку таблицы
-    // нужно искать, а не считать первой строкой.
-    grid = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    const parsed = bankParser.parseStatement(req.file.buffer, req.file.originalname);
+    operations = parsed.operations;
+    parseFormat = parsed.format;
   } catch (e) {
     return res.status(400).json({ error: 'Не получилось прочитать файл: ' + e.message });
   }
 
-  const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-
-  // Ищем строку-шапку: она содержит одновременно что-то похожее на "дата"
-  // и что-то похожее на дебет/кредит/сумму.
-  let headerRowIndex = -1;
-  let cols = {};
-  for (let r = 0; r < Math.min(grid.length, 40); r++) {
-    const cells = (grid[r] || []).map(norm);
-    const findCol = (test) => cells.findIndex(test);
-    const dateCol = findCol(c => c.includes('дата') && !c.includes('валют'));
-    const debitCol = findCol(c => c.includes('дебет'));
-    const creditCol = findCol(c => c.includes('кредит') && !c.includes('корреспондент'));
-    const amountCol = findCol(c => c.includes('сумма') && !c.includes('конверт'));
-    if (dateCol !== -1 && (debitCol !== -1 || creditCol !== -1 || amountCol !== -1)) {
-      headerRowIndex = r;
-      cols = {
-        date: dateCol,
-        debit: debitCol,
-        credit: creditCol,
-        amount: amountCol,
-        purpose: findCol(c => c.includes('мақсат') || c.includes('назначен') || c.includes('комментарий')),
-        counterparty: findCol(c => c.includes('корреспондент') && !c.includes('банк') && !c.includes('бик') && !c.includes('иик')),
-        senderBin: findCol(c => (c.includes('бин') || c.includes('иин')) && c.includes('отправ')),
-        receiverBin: findCol(c => (c.includes('бин') || c.includes('иин')) && c.includes('получ')),
-        binGeneric: findCol(c => c.includes('бин') || c.includes('иин')),
-        knp: findCol(c => c.includes('кнп') || c.includes('тмк')),
-      };
-      break;
-    }
-  }
-
-  let operations = [];
-  const parseAmount = (v) => {
-    if (v === '' || v === undefined || v === null) return 0;
-    const s = String(v).replace(/\s/g, '').replace(',', '.');
-    const n = parseFloat(s);
-    return isNaN(n) ? 0 : n;
-  };
-
-  if (headerRowIndex !== -1) {
-    // Формат с "шапкой банка" + двуязычными заголовками (БЦК, Kaspi Business и похожие)
-    for (let r = headerRowIndex + 1; r < grid.length; r++) {
-      const row = grid[r];
-      if (!row || row.every(c => String(c).trim() === '')) continue;
-      const debit = cols.debit !== -1 ? parseAmount(row[cols.debit]) : 0;
-      const credit = cols.credit !== -1 ? parseAmount(row[cols.credit]) : 0;
-      const single = cols.amount !== -1 ? parseAmount(row[cols.amount]) : 0;
-      const amount = credit || (debit ? -debit : single);
-      const dateRaw = cols.date !== -1 ? String(row[cols.date] || '') : '';
-      if (!dateRaw && !amount) continue;
-      const bin = credit
-        ? (cols.senderBin !== -1 ? row[cols.senderBin] : row[cols.binGeneric])
-        : (cols.receiverBin !== -1 ? row[cols.receiverBin] : row[cols.binGeneric]);
-      operations.push({
-        id: crypto.randomUUID(),
-        date: dateRaw.split(' ')[0] || dateRaw,
-        counterparty: fixKazakhMojibake(cols.counterparty !== -1 ? row[cols.counterparty] : ''),
-        bin: String(bin || '').trim(),
-        purpose: fixKazakhMojibake(cols.purpose !== -1 ? row[cols.purpose] : ''),
-        knp: cols.knp !== -1 ? String(row[cols.knp] || '') : '', // код назначения платежа — берём прямо из выписки банка
-        amount,
-        suggestedCategory: '',
-        status: 'review',
-        sourceFile: req.file.originalname,
-        rowIndex: r,
-      });
-    }
-  } else {
-    // Запасной вариант: простые выписки, где заголовки — в самой первой строке
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const objRows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-    const pick = (row, names) => {
-      for (const n of names) {
-        const key = Object.keys(row).find(k => k.trim().toLowerCase() === n);
-        if (key) return row[key];
-      }
-      return '';
-    };
-    operations = objRows.map((row, i) => {
-      const dateRaw = pick(row, ['дата', 'дата операции', 'дата документа']);
-      const amountIn = parseFloat(pick(row, ['приход', 'сумма прихода']) || 0) || 0;
-      const amountOut = parseFloat(pick(row, ['расход', 'сумма расхода']) || 0) || 0;
-      const amountSingle = parseFloat(pick(row, ['сумма']) || 0) || 0;
-      const amount = amountIn || (amountOut ? -amountOut : amountSingle);
-      return {
-        id: crypto.randomUUID(),
-        date: String(dateRaw || ''),
-        counterparty: fixKazakhMojibake(pick(row, ['контрагент', 'наименование контрагента', 'плательщик/получатель'])),
-        bin: String(pick(row, ['бин', 'иин', 'бин/иин']) || ''),
-        purpose: fixKazakhMojibake(pick(row, ['назначение платежа', 'назначение', 'комментарий'])),
-        knp: String(pick(row, ['кнп', 'код назначения платежа', 'тмк']) || ''),
-        amount,
-        suggestedCategory: '',
-        status: 'review',
-        sourceFile: req.file.originalname,
-        rowIndex: i,
-      };
-    }).filter(op => op.date || op.amount);
-  }
-
   const all = await getStore('operations', []);
 
-  // Не добавляем операцию повторно, если такая же (по дате, сумме, БИН и
-  // назначению) уже есть в списке — иначе повторная загрузка того же файла
-  // (или пересекающийся период в другом файле) задваивает список. Сравниваем
-  // по "отпечатку" — он сглаживает мелкие различия в написании БИН/названия
-  // между разными выгрузками одного и того же банка.
+  // 2. duplicateGuard: не добавляем операцию повторно, если такая же (по
+  // отпечатку — дата+сумма+БИН+название+назначение) уже есть в списке —
+  // иначе повторная загрузка того же файла (или пересекающийся период в
+  // другом файле) задваивает список.
   operations.forEach(op => { op.fingerprint = makeFingerprint(op); });
   const existingFingerprints = new Set(all.map(o => o.fingerprint || makeFingerprint(o)));
   const newOnly = operations.filter(op => !existingFingerprints.has(op.fingerprint));
@@ -1335,85 +1087,18 @@ app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => 
   const updated = [...all, ...newOnly];
   await setStore('operations', updated);
   await addHistory(
-    `Загружена выписка ${req.file.originalname} · ${newOnly.length} новых операций` +
+    `Загружена выписка ${req.file.originalname} (формат разбора: ${parseFormat}) · ${newOnly.length} новых операций` +
       (skippedDuplicates ? ` · ${skippedDuplicates} пропущено как дубли` : ''),
     '—'
   );
 
-  // Сразу пытаемся сопоставить контрагентов по БИН/ИИН со справочником 1С,
-  // и проверить — нет ли такой операции уже среди документов в самой 1С
-  // (чтобы не предлагать создавать то, что уже разнесено вручную или
-  // другим способом). Всё это — только если подключение уже настроено.
+  // 3. reconcileStatement: сопоставление контрагента/истории/договора с 1С
+  // и проверка "не разнесено ли уже" — только если подключение настроено.
   const settingsForMatch = await getStore('settings', {});
-  if (settingsForMatch.baseUrl && settingsForMatch.login) {
-    for (const op of newOnly) {
-      const target = updated.find(o => o.id === op.id);
-
-      try {
-        const alreadyExists = await checkExistingInOnec(op, settingsForMatch);
-        if (alreadyExists) {
-          target.status = 'already_in_1c';
-          continue; // не тратим время на сопоставление контрагента — операция и так пропускается
-        }
-      } catch (e) {
-        // Если сверка не удалась — не блокируем, просто идём дальше как обычно.
-      }
-
-      try {
-        const found = await findCounterpartyByBin(op.bin, settingsForMatch, op.counterparty);
-        if (found) {
-          target.counterpartyKey = found.Ref_Key;
-          target.counterpartyMatchedName = found.Description || '';
-
-          // Смотрим, как этот контрагент категоризировался раньше в 1С —
-          // если найдём паттерн, используем ту же статью ДДС автоматически.
-          try {
-            const historical = await findHistoricalCategory(found.Ref_Key, op.amount, settingsForMatch, op.purpose);
-            if (historical) {
-              target.historicalCategory = historical.categoryName || '';
-              target.historicalCategoryKey = historical.categoryKey || '';
-              target.historicalOperationKind = historical.operationKind || '';
-              target.historicalDebtType = historical.debtType || '';
-            }
-          } catch (e) {
-            // Не критично — просто не будет автопредложения по истории для этой операции.
-          }
-
-          // Ищем договор контрагента — если он есть в справочнике и найден
-          // однозначно, привяжем его к документу автоматически.
-          try {
-            const contract = await resolveSupplierContract(found.Ref_Key, op.purpose, settingsForMatch);
-            target.contractStatus = contract.status;
-            if (contract.status === 'matched') {
-              target.contractKey = contract.key;
-              target.contractName = contract.name;
-            } else if (contract.status === 'ambiguous') {
-              target.contractOptions = contract.options;
-            }
-          } catch (e) {
-            // Не критично — просто без привязки к договору.
-          }
-        } else {
-          target.status = 'new_counterparty';
-        }
-      } catch (e) {
-        if (e.ambiguousCounterparty) {
-          target.status = 'ambiguous_counterparty';
-          target.counterpartyOptions = e.ambiguousCounterparty.map(o => ({ key: o.Ref_Key, name: o.Description }));
-        }
-        // Иначе — проверка не удалась (например, неверный пароль) — не
-        // блокируем загрузку, просто оставляем операцию как есть, на проверке.
-      }
-    }
+  const reconciliation = await reconcileStatement(newOnly, updated, settingsForMatch);
+  if (reconciliation.connected) {
     await setStore('operations', updated);
   }
-
-  const reconciliation = {
-    total: newOnly.length,
-    alreadyIn1c: newOnly.filter(o => updated.find(u => u.id === o.id)?.status === 'already_in_1c').length,
-    newCounterparty: newOnly.filter(o => updated.find(u => u.id === o.id)?.status === 'new_counterparty').length,
-    connected: !!(settingsForMatch.baseUrl && settingsForMatch.login),
-  };
   await addHistory(
     `Сверка с 1С: из ${reconciliation.total} операций — уже в 1С: ${reconciliation.alreadyIn1c}, новых контрагентов: ${reconciliation.newCounterparty}`,
     '—'
@@ -1432,12 +1117,7 @@ app.get('/api/operations', requireAuth, async (req, res) => {
   //   3. Ваши правила из раздела «Правила» (включая типовые из регламента и КНП)
   //   4. Базовая логика покупатель/поставщик по регламенту (всегда есть)
   const withCategories = ops.map(op => {
-    const ruleMatch = applyRules(op, rules);
-    const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
-    const account = op.manualAccount || op.historicalAccount || ruleMatch.account;
-    const operationKind = op.manualOperationKind || op.historicalOperationKind || ruleMatch.operationKind;
-    const debtType = op.manualDebtType || op.historicalDebtType || ruleMatch.debtType;
-    const isDefaultOnly = !op.manualCategory && !op.historicalCategory && ruleMatch.source === 'default';
+    const { category, account, operationKind, debtType, isDefaultOnly, needsAttention } = classifyOperation(op, rules);
     return {
       ...op,
       suggestedCategory: category,
@@ -1445,7 +1125,7 @@ app.get('/api/operations', requireAuth, async (req, res) => {
       suggestedOperationKind: operationKind,
       suggestedDebtType: debtType,
       isDefaultOnly, // категория определена только базовой логикой, стоит перепроверить глазами
-      needsAttention: !category,
+      needsAttention,
     };
   });
   res.json(withCategories);
@@ -1607,11 +1287,7 @@ async function confirmOperation(op, all, settings, rules) {
   // ручная правка > история 1С (уже обновлённая на шаге перепроверки выше)
   // > правила > базовая логика (которая всегда что-то определяет, так что
   // пусто может быть, только если что-то совсем не так с данными).
-  const ruleMatch = applyRules(op, rules);
-  const category = op.manualCategory || op.historicalCategory || ruleMatch.category;
-  const account = op.manualAccount || op.historicalAccount || ruleMatch.account;
-  const operationKind = op.manualOperationKind || op.historicalOperationKind || ruleMatch.operationKind;
-  const debtType = op.manualDebtType || op.historicalDebtType || ruleMatch.debtType;
+  const { category, account, operationKind, debtType } = classifyOperation(op, rules);
   if (!category) {
     return { ok: false, httpStatus: 400, error: 'Не определена статья ДДС — поправьте вручную в карточке операции, прежде чем подтверждать.' };
   }
@@ -1622,9 +1298,8 @@ async function confirmOperation(op, all, settings, rules) {
   // по ней документ УЖЕ был создан — значит, эта операция, скорее всего,
   // попала в список второй раз (например, из пересекающегося периода двух
   // выгрузок) и создавать по ней ещё один черновик не нужно.
-  const fingerprint = makeFingerprint(op);
-  op.fingerprint = fingerprint;
-  const duplicateOf = all.find(o => o.id !== op.id && o.documentCreated && makeFingerprint(o) === fingerprint);
+  op.fingerprint = makeFingerprint(op);
+  const duplicateOf = findDuplicateAmongOperations(op, all);
   if (duplicateOf) {
     op.status = 'duplicate';
     await addHistory(`Пропущено как дубликат уже созданного документа (№${duplicateOf.onecDocNumber || '—'}): ${op.counterparty || 'операция'}`, '—');
@@ -2041,751 +1716,15 @@ async function addHistory(action, doc) {
   await setStore('history', h.slice(0, 500));
 }
 
-// Ищет контрагента в справочнике 1С по БИН/ИИН через OData.
-// Возвращает объект контрагента (с Ref_Key) или null, если не найден.
-// Проверяет, нет ли уже среди документов 1С (Платёжное поручение
-// входящее/исходящее) операции с такой же датой и суммой — чтобы не
-// предлагать создавать то, что уже разнесено (вручную или иначе).
-async function checkExistingInOnec(op, settings) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const docType = op.amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
-  const amount = Math.abs(op.amount);
-  // Дата у нас хранится как ДД.ММ.ГГГГ — переводим в ГГГГ-ММ-ДД для фильтра OData
-  const parts = String(op.date).split('.');
-  if (parts.length !== 3) return false;
-  const isoDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
-  const filter = encodeURIComponent(
-    `Date ge datetime'${isoDate}T00:00:00' and Date le datetime'${isoDate}T23:59:59' and СуммаДокумента eq ${amount}`
-  );
-  const url = `${base}/${docType}?$format=json&$filter=${filter}&$select=Ref_Key`;
-
-  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-  if (!response.ok) return false; // если сверить не удалось — не блокируем, просто считаем, что не нашли
-  const data = await response.json().catch(() => null);
-  if (!data) return false;
-  return (data.value || []).length > 0;
-}
-
-// Пытается найти номер договора прямо в тексте назначения платежа —
-// банки/бухгалтеры обычно пишут "по дог. №...", "договор №...", "дог. N..."
-function extractContractNumber(purpose) {
-  if (!purpose) return null;
-  const match = purpose.match(/до?г(?:овор)?\.?\s*(?:№|N|no\.?)?\s*([\w\-\/]{2,})/i);
-  return match ? match[1] : null;
-}
-
-// Ищет договор(ы) контрагента в 1С. Если найден ровно один — используем
-// его автоматически. Если несколько — не гадаем, а помечаем операцию как
-// требующую ручного выбора договора. Если в тексте назначения нашёлся
-// номер договора — в первую очередь пытаемся сопоставить именно по нему.
-const CONTRACT_CATALOG_CANDIDATES = ['Catalog_ДоговорыКонтрагентов', 'Catalog_Договоры'];
-const NO_CONTRACT_NAME = 'Без договора';
-
-// Имя поля-владельца в справочнике договоров тоже отличается между
-// конфигурациями (Владелец_Key vs Контрагент_Key). Раньше оба поля
-// проверялись ОДНИМ запросом через "or" — но если хотя бы одного из двух
-// полей нет в конкретном справочнике, OData 1С отклоняет весь запрос
-// целиком (ошибка парсинга фильтра), и мы тихо теряли договор, который на
-// самом деле есть. Теперь, как и с БИН/ИИН, пробуем поля ПО ОДНОМУ и
-// запоминаем рабочую комбинацию "справочник + поле".
-const CONTRACT_OWNER_FIELD_CANDIDATES = ['Владелец_Key', 'Контрагент_Key'];
-let workingContractCatalog = null;
-let workingContractOwnerField = null;
-
-async function fetchContractsByOwner(counterpartyKey, settings, extraFilter) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-
-  async function tryCombo(catalog, field) {
-    let filter = `${field} eq guid'${counterpartyKey}'`;
-    if (extraFilter) filter += ` and ${extraFilter}`;
-    const url = `${base}/${catalog}?$format=json&$filter=${encodeURIComponent(filter)}&$select=Ref_Key,Description,Number&$top=20`;
-    console.log(`[findContractForCounterparty] запрос: ${catalog}.${field}${extraFilter ? ' + ' + extraFilter : ''}`);
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) return null; // это поле/справочник не подошли — пробуем другую комбинацию
-    const data = await response.json().catch(() => null);
-    return data ? (data.value || []) : null;
-  }
-
-  if (workingContractCatalog && workingContractOwnerField) {
-    const list = await tryCombo(workingContractCatalog, workingContractOwnerField);
-    if (list !== null) return { catalog: workingContractCatalog, list };
-    workingContractCatalog = null;
-    workingContractOwnerField = null; // рабочая комбинация перестала работать — определим заново
-  }
-  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
-    for (const field of CONTRACT_OWNER_FIELD_CANDIDATES) {
-      const list = await tryCombo(catalog, field);
-      if (list !== null) {
-        workingContractCatalog = catalog;
-        workingContractOwnerField = field;
-        return { catalog, list };
-      }
-    }
-  }
-  console.log('[findContractForCounterparty] ни одна комбинация справочник+поле не сработала — проверьте название справочника договоров в вашей 1С');
-  return null;
-}
-
-async function findContractForCounterparty(counterpartyKey, purposeText, settings) {
-  if (!counterpartyKey) return { status: 'none' };
-  const result = await fetchContractsByOwner(counterpartyKey, settings);
-  if (!result || result.list.length === 0) return { status: 'none' };
-  const { list } = result;
-
-  if (list.length === 1) {
-    console.log(`[findContractForCounterparty] найден единственный договор: ${list[0].Description || list[0].Number}`);
-    return { status: 'matched', key: list[0].Ref_Key, name: list[0].Description || list[0].Number };
-  }
-
-  // Несколько договоров — пробуем сопоставить по номеру, найденному в назначении платежа
-  const hint = extractContractNumber(purposeText);
-  if (hint) {
-    const byNumber = list.find(d =>
-      (d.Number && d.Number.includes(hint)) || (d.Description && d.Description.includes(hint))
-    );
-    if (byNumber) {
-      return { status: 'matched', key: byNumber.Ref_Key, name: byNumber.Description || byNumber.Number };
-    }
-  }
-  console.log(`[findContractForCounterparty] неоднозначно: найдено ${list.length} договоров`);
-  return { status: 'ambiguous', options: list.map(d => ({ key: d.Ref_Key, name: d.Description || d.Number })) };
-}
-
-// Ищет договор конкретного контрагента с названием "Без договора" —
-// отдельным точным запросом (не полагаемся только на findContractForCounterparty,
-// т.к. если у контрагента больше одного договора, "Без договора" может
-// потеряться среди неоднозначных вариантов).
-async function findNoContractRecord(counterpartyKey, settings) {
-  const result = await fetchContractsByOwner(counterpartyKey, settings, `Description eq '${NO_CONTRACT_NAME}'`);
-  const found = result && result.list[0];
-  if (found) {
-    console.log(`[findNoContractRecord] найден договор "Без договора": ${found.Ref_Key}`);
-    return { catalog: result.catalog, key: found.Ref_Key, name: found.Description };
-  }
-  console.log('[findNoContractRecord] договор "Без договора" не найден для этого контрагента');
-  return null;
-}
-
-// Полная логика подбора договора для «Оплата поставщику»:
-//   1) если у контрагента найден ровно один договор (или однозначно по
-//      номеру в назначении платежа) — используем его;
-//   2) если договоров несколько и не определить — статус "ambiguous",
-//      выбор за бухгалтером;
-//   3) если договоров нет вообще — отдельно ищем именно "Без договора";
-//   4) если и его нет — не гадаем и не создаём автоматически, а сообщаем,
-//      что нужно создать "Без договора" (кнопкой в кабинете либо вручную в 1С).
-async function resolveSupplierContract(counterpartyKey, purposeText, settings) {
-  if (!counterpartyKey) return { status: 'none' };
-  const primary = await findContractForCounterparty(counterpartyKey, purposeText, settings);
-  if (primary.status === 'matched' || primary.status === 'ambiguous') return primary;
-
-  const noContract = await findNoContractRecord(counterpartyKey, settings);
-  if (noContract) {
-    return { status: 'matched', key: noContract.key, name: noContract.name };
-  }
-  return { status: 'need_create_no_contract' };
-}
-
-// Создаёт в справочнике договоров запись "Без договора" для контрагента.
-// Вызывается ТОЛЬКО по явному действию бухгалтера (кнопка в кабинете) —
-// никогда автоматически при создании черновика документа.
-async function createNoContractInOnec(counterpartyKey, settings) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-
-  async function tryPost(catalog, field) {
-    const payload = { Description: NO_CONTRACT_NAME, [field]: counterpartyKey };
-    console.log(`[createNoContractInOnec] создаю "${NO_CONTRACT_NAME}" в ${catalog}.${field}`);
-    const response = await fetch(`${base}/${catalog}?$format=json`, {
-      method: 'POST',
-      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) return null;
-    return response.json().catch(() => ({}));
-  }
-
-  // Если уже знаем рабочую комбинацию справочник+поле — используем её сразу.
-  if (workingContractCatalog && workingContractOwnerField) {
-    const created = await tryPost(workingContractCatalog, workingContractOwnerField);
-    if (created) return created;
-  }
-  for (const catalog of CONTRACT_CATALOG_CANDIDATES) {
-    for (const field of CONTRACT_OWNER_FIELD_CANDIDATES) {
-      const created = await tryPost(catalog, field);
-      if (created) {
-        workingContractCatalog = catalog;
-        workingContractOwnerField = field;
-        return created;
-      }
-    }
-  }
-  throw new Error('Не удалось создать договор "Без договора" — проверьте название справочника договоров и поля владельца в вашей конфигурации 1С');
-}
-
-// Создаёт нового контрагента в справочнике 1С. Вызывается ТОЛЬКО по явному
-// клику бухгалтера на кнопку "Создать нового" — эндпоинт перед вызовом этой
-// функции всегда сначала перепроверяет по нормализованному БИН/ИИН и
-// названию, что контрагента точно ещё нет.
-async function createCounterpartyInOnec(op, settings) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const normalizedBin = String(op.bin || '').replace(/\D/g, '');
-  const description = String(op.counterparty || normalizedBin || 'Без названия').trim();
-
-  // Имя поля с БИН/ИИН берём то, которое реально работает в вашей базе
-  // (определяется при поиске контрагента) — если ещё не определено,
-  // используем ИИН как самый частый вариант для казахстанских конфигураций.
-  const binField = workingBinField || 'ИИН';
-  const payload = { Description: description };
-  if (normalizedBin) payload[binField] = normalizedBin;
-  console.log(`[createCounterpartyInOnec] создаю контрагента: "${description}", ${binField}="${normalizedBin}"`);
-
-  const response = await fetch(`${base}/Catalog_Контрагенты?$format=json`, {
-    method: 'POST',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
-  }
-  return response.json().catch(() => ({}));
-}
-
-// Ищет статью ДДС в справочнике 1С по точному названию (например,
-// «Аренда» или «Расчёты с поставщиками и подрядчиками») и возвращает её
-// GUID. Нужно, когда категория пришла из текстового правила или ручной
-// правки, а не из уже готового документа в 1С.
-async function findCategoryKeyByName(name, settings) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const candidates = ['Catalog_СтатьиДвиженияДенежныхСредств', 'Catalog_СтатьиДДС'];
-  const cleanName = String(name).trim().replace(/'/g, "''");
-  console.log(`[findCategoryKeyByName] ищу статью ДДС: "${name}"`);
-
-  async function tryUrl(url) {
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) return null;
-    const data = await response.json().catch(() => null);
-    return (data && data.value) || [];
-  }
-
-  for (const catalog of candidates) {
-    // 1. Точное совпадение по названию (самый надёжный вариант)
-    const exactUrl = `${base}/${catalog}?$format=json&$filter=${encodeURIComponent(`Description eq '${cleanName}'`)}&$select=Ref_Key,Description&$top=1`;
-    let list = await tryUrl(exactUrl);
-    if (list === null) continue; // этого справочника нет под таким именем — пробуем следующий
-    if (list.length) {
-      console.log(`[findCategoryKeyByName] найдено точным совпадением в ${catalog}: ${list[0].Description}`);
-      return list[0].Ref_Key;
-    }
-
-    // 2. Точное совпадение иногда не срабатывает из-за разного написания
-    // "е"/"ё" ("Расчеты"/"Расчёты") или лишних пробелов — пробуем частичное
-    // совпадение по буквам без "ё", это покрывает оба варианта написания.
-    const looseName = cleanName.replace(/ё/gi, m => (m === 'ё' ? 'е' : 'Е'));
-    const looseUrl = `${base}/${catalog}?$format=json&$filter=${encodeURIComponent(`substringof('${looseName}', Description)`)}&$select=Ref_Key,Description&$top=3`;
-    list = await tryUrl(looseUrl);
-    if (list && list.length) {
-      console.log(`[findCategoryKeyByName] найдено частичным совпадением в ${catalog}: ${list[0].Description}`);
-      return list[0].Ref_Key;
-    }
-  }
-  console.log(`[findCategoryKeyByName] статья ДДС "${name}" не найдена ни в одном справочнике-кандидате`);
-  return null;
-}
-
-// "Счёт учёта (БУ)" в табличной части документа — это ссылка на план счетов
-// (Chart of Accounts), а не просто текст "1251": нужно найти GUID счёта по
-// его коду. Название самого объекта плана счетов в OData отличается между
-// конфигурациями 1С — пробуем частые варианты и запоминаем рабочий, как и с
-// полем БИН/ИИН. Счёт может храниться у нас как пара "1251/3510"
-// (счёт расчётов/счёт авансов) — для табличной части берём основную часть
-// до "/".
-const CHART_OF_ACCOUNTS_CANDIDATES = ['ChartOfAccounts_Хозрасчетный', 'ChartOfAccounts_Хозрасчетный2', 'ChartOfAccounts_Управленческий'];
-let workingChartOfAccounts = null;
-
-async function findAccountKeyByCode(code, settings) {
-  if (!code) return null;
-  const primaryCode = String(code).split('/')[0].trim();
-  if (!primaryCode) return null;
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-
-  async function tryChart(chart) {
-    const filter = encodeURIComponent(`Code eq '${primaryCode}'`);
-    const url = `${base}/${chart}?$format=json&$filter=${filter}&$select=Ref_Key&$top=1`;
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) return { exists: false };
-    const data = await response.json().catch(() => null);
-    if (!data) return { exists: false };
-    return { exists: true, found: (data.value || [])[0] || null };
-  }
-
-  if (workingChartOfAccounts) {
-    const r = await tryChart(workingChartOfAccounts);
-    if (r.exists) return r.found ? r.found.Ref_Key : null;
-    workingChartOfAccounts = null;
-  }
-  for (const chart of CHART_OF_ACCOUNTS_CANDIDATES) {
-    const r = await tryChart(chart);
-    if (r.exists) {
-      workingChartOfAccounts = chart;
-      return r.found ? r.found.Ref_Key : null;
-    }
-  }
-  return null; // ни один вариант плана счетов не подошёл — не страшно, просто не заполним это поле
-}
-
-async function findHistoricalCategory(counterpartyKey, amount, settings, currentPurpose) {
-  if (!counterpartyKey) return null;
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const docType = amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
-
-  // Статья ДДС в реальности лежит ВНУТРИ табличной части "РасшифровкаПлатежа",
-  // а не на уровне самого документа — поэтому обязательно разворачиваем её
-  // через $expand, иначе эти поля просто не приедут в ответе.
-  //
-  // Смотрим НЕСКОЛЬКО последних документов (не только самый свежий), потому
-  // что у одного контрагента может быть несколько РАЗНЫХ типов операций
-  // (например, разные виды переводов) — берём не просто "любой заполненный",
-  // а тот, чьё назначение платежа больше всего похоже на текущую операцию.
-  const filter = encodeURIComponent(`Контрагент_Key eq guid'${counterpartyKey}'`);
-  const url = `${base}/${docType}?$format=json&$filter=${filter}&$orderby=Date desc&$top=15&$expand=РасшифровкаПлатежа`;
-
-  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-  if (!response.ok) return null;
-  const data = await response.json().catch(() => null);
-  const docs = (data && data.value) || [];
-
-  // Похожесть текста назначения платежа: доля общих слов (без учёта
-  // регистра), длиной от 3 букв — так короткие союзы/предлоги не мешают.
-  function wordSet(text) {
-    return new Set(String(text || '').toLowerCase().match(/[а-яёіңғүұқөһa-z]{3,}/g) || []);
-  }
-  const currentWords = wordSet(currentPurpose);
-  function similarity(otherText) {
-    if (!currentWords.size) return 0;
-    const otherWords = wordSet(otherText);
-    if (!otherWords.size) return 0;
-    let common = 0;
-    for (const w of currentWords) if (otherWords.has(w)) common++;
-    return common / currentWords.size;
-  }
-
-  // Собираем всех кандидатов, у кого есть хотя бы статья ДДС, и сортируем
-  // по похожести назначения платежа (лучшее совпадение — первым). При
-  // равной похожести побеждает наличие ещё и заполненного вида операции.
-  const candidates = [];
-  for (const candidate of docs) {
-    const candidateRow = candidate.РасшифровкаПлатежа && candidate.РасшифровкаПлатежа[0];
-    const candidateCategoryKey = candidateRow && candidateRow.СтатьяДвиженияДенежныхСредств_Key;
-    if (!candidateCategoryKey) continue;
-    candidates.push({
-      doc: candidate,
-      row: candidateRow,
-      categoryKey: candidateCategoryKey,
-      score: similarity(candidate.НазначениеПлатежа || candidate.Комментарий) + (candidate.ВидОперации ? 0.01 : 0),
-    });
-  }
-  candidates.sort((a, b) => b.score - a.score);
-  const best = candidates[0];
-  if (!best) return null;
-  const { doc, row, categoryKey } = best;
-  if (!doc || !categoryKey) return null;
-
-  const debtType = (row && (row.ВидЗадолженности || row.ВидЗадолженности_Key)) || '';
-
-  // Статья хранится как GUID — подтягиваем её человекочитаемое название
-  const categoryCatalogs = ['Catalog_СтатьиДвиженияДенежныхСредств', 'Catalog_СтатьиДДС'];
-  for (const catalog of categoryCatalogs) {
-    const catUrl = `${base}/${catalog}(guid'${categoryKey}')?$format=json&$select=Description`;
-    const catResp = await fetch(catUrl, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (catResp.ok) {
-      const catData = await catResp.json().catch(() => null);
-      if (catData && catData.Description) {
-        return { categoryKey, categoryName: catData.Description, operationKind: doc.ВидОперации || '', debtType };
-      }
-    }
-  }
-  return { categoryKey, categoryName: '', operationKind: doc.ВидОперации || '' };
-}
-
-// Название поля с БИН/ИИН отличается между конфигурациями 1С. Вместо
-// одного запроса со всеми вариантами сразу (он падает целиком, если хотя
-// бы одного поля нет — «Сегмент пути БИН не найден»), пробуем варианты
-// по очереди и запоминаем то, которое сработало.
-const BIN_FIELD_CANDIDATES = ['ИИН', 'БИН', 'ИНН', 'БИН_ИИН', 'ИИН_БИН', 'ИННЮЛ', 'ИННФЛ', 'КодПоОКПО', 'РегистрационныйНомер'];
-let workingBinField = null; // определяется один раз за время работы сервера
-
-async function findCounterpartyByBin(bin, settings, name) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-
-  // БИН/ИИН из выписки иногда приходит с пробелами, апострофами или
-  // текстовым форматированием Excel ("123 456 789 012", "'123456789012") —
-  // а в справочнике 1С хранится как чистая строка цифр. Сравнение "как есть"
-  // в таких случаях просто не находит существующего контрагента.
-  const normalizedBin = String(bin || '').replace(/\D/g, '');
-  console.log(`[findCounterpartyByBin] ищу контрагента: БИН/ИИН="${bin}" -> "${normalizedBin}", название="${name || ''}"`);
-
-  async function tryField(field) {
-    const filter = encodeURIComponent(`${field} eq '${normalizedBin}'`);
-    const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}&$top=1`;
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) return { fieldExists: false };
-    const data = await response.json().catch(() => null);
-    if (!data) return { fieldExists: false };
-    const found = (data.value || [])[0] || null;
-    console.log(`[findCounterpartyByBin] поле ${field}: ${found ? 'найден ' + found.Description : 'не найден'}`);
-    return { fieldExists: true, found };
-  }
-
-  // Запасной поиск по названию — на случай, если БИН в выписке не
-  // считался или не совпал по формату, а контрагент в справочнике на
-  // самом деле есть. ВАЖНО: раньше здесь брался первый попавшийся
-  // результат ($top=1) — если в справочнике несколько похожих записей,
-  // легко было тихо выбрать не того контрагента. Теперь: сначала пробуем
-  // точное совпадение по названию; если его нет — смотрим частичные
-  // совпадения, и если их больше одного, ЧЕСТНО сообщаем о неоднозначности,
-  // а не гадаем.
-  async function fetchByFilter(filter, top) {
-    const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${encodeURIComponent(filter)}&$top=${top}`;
-    const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-    if (!response.ok) return null;
-    const data = await response.json().catch(() => null);
-    return (data && data.value) || [];
-  }
-
-  async function tryByName() {
-    if (!name || name.trim().length < 3) return null;
-    const cleanName = name.trim().replace(/'/g, "''");
-
-    // 1. Точное совпадение по исходному названию — самый надёжный вариант
-    const exactList = await fetchByFilter(`Description eq '${cleanName}'`, 2);
-    if (exactList && exactList.length === 1) return { match: exactList[0] };
-    if (exactList && exactList.length > 1) return { ambiguous: true, options: exactList };
-
-    // 2. Частичное совпадение по исходному названию
-    const partialList = await fetchByFilter(`substringof('${cleanName}', Description)`, 10);
-    let candidates = partialList || [];
-
-    // 3. Если ничего не нашли — та же попытка, но по "ядру" названия без
-    // организационно-правовой формы (ТОО/ИП/АО/…) и кавычек: банковская
-    // выписка и справочник 1С часто пишут форму по-разному.
-    if (candidates.length === 0) {
-      const normalizedTarget = normalizeCounterpartyName(name);
-      if (normalizedTarget && normalizedTarget.length >= 3) {
-        const wide = await fetchByFilter(`substringof('${normalizedTarget.replace(/'/g, "''")}', Description)`, 15);
-        candidates = (wide || []).filter(o => normalizeCounterpartyName(o.Description) === normalizedTarget);
-        // Если точных совпадений "ядра" не набралось — берём как есть, лучше
-        // честно показать неоднозначность, чем не найти существующего контрагента.
-        if (candidates.length === 0) candidates = wide || [];
-      }
-    }
-
-    if (candidates.length === 0) return null;
-    if (candidates.length === 1) return { match: candidates[0] };
-    return { ambiguous: true, options: candidates };
-  }
-
-  async function resolveByName() {
-    const r = await tryByName();
-    if (!r) return null;
-    if (r.ambiguous) {
-      const err = new Error(
-        `По имени "${name}" в справочнике нашлось ${r.options.length} разных контрагентов ` +
-        `(${r.options.map(o => o.Description).join(', ')}) — не могу понять, какой из них правильный. ` +
-        `Сопоставьте контрагента вручную для этой операции.`
-      );
-      err.ambiguousCounterparty = r.options;
-      throw err;
-    }
-    return r.match;
-  }
-
-  // Если рабочее поле уже определено — сразу используем его.
-  if (workingBinField && normalizedBin) {
-    const r = await tryField(workingBinField);
-    if (r.fieldExists) {
-      if (r.found) return r.found;
-      return await resolveByName(); // БИН не совпал — пробуем по названию
-    }
-    workingBinField = null; // поле перестало работать — определим заново
-  }
-
-  if (!normalizedBin) return await resolveByName(); // БИН в выписке пуст — сразу по названию
-
-  const errors = [];
-  for (const field of BIN_FIELD_CANDIDATES) {
-    const r = await tryField(field);
-    if (r.fieldExists) {
-      workingBinField = field; // запомнили — дальше будет быстро
-      if (r.found) return r.found;
-      return await resolveByName(); // поле рабочее, но по БИН не нашли — пробуем по названию
-    }
-    errors.push(field);
-  }
-  // Ни одно поле с БИН не сработало вообще — прежде чем сдаться, всё
-  // равно пробуем по названию.
-  return await resolveByName();
-}
-
-// Свободный ручной поиск контрагента по части названия — используется, когда
-// бухгалтер сам проверяет "а нет ли он уже в 1С", прежде чем соглашаться на
-// создание нового. В отличие от tryByName() внутри findCounterpartyByBin (та
-// возвращает ошибку при неоднозначности), здесь мы, наоборот, ХОТИМ увидеть
-// все подходящие варианты списком, чтобы человек выбрал нужный сам.
-async function searchCounterpartyByText(query, settings) {
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const cleanQuery = query.replace(/'/g, "''");
-  const filter = encodeURIComponent(`substringof('${cleanQuery}', Description)`);
-  const url = `${base}/Catalog_Контрагенты?$format=json&$filter=${filter}&$select=Ref_Key,Description&$top=20`;
-  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 200)}`);
-  }
-  const data = await response.json().catch(() => null);
-  return (data && data.value) || [];
-}
-
-// =====================================================================
-// Вызов через OData стандартного интерфейса 1С:Фреш — на основе полей,
-// которые реально видны в вашей базе (Date, Number, Организация_Key,
-// СчетОрганизации_Key, Контрагент_Key, ВидОперации,
-// СтатьяДвиженияДенежныхСредств_Key, СуммаДокумента, НазначениеПлатежа).
-//
-// settings.baseUrl должен быть вида:
-//   https://1cfresh.kz/a/ea170/264256/odata/standard.odata/
-// (без имени документа на конце — его добавляем здесь).
-//
-// ВАЖНО: Организация_Key и СчетОрганизации_Key — это GUID-идентификаторы
-// вашей организации и расчётного счёта в справочниках 1С. Их нужно один
-// раз узнать (через тот же OData: .../Catalog_Организации?$format=json)
-// и вписать в настройки — без них документ не создать.
-// =====================================================================
-
-// "Подотчётник" в документе "Перечисление денежных средств подотчётнику" —
-// это ссылка на элемент справочника ФИЗИЧЕСКИХ ЛИЦ (Catalog_ФизическиеЛица),
-// а НЕ на контрагента (Catalog_Контрагенты). У них разные Ref_Key, даже если
-// это один и тот же человек и имя совпадает — поэтому ищем отдельно, по ФИО.
-async function findIndividualKeyByName(name, settings) {
-  if (!name) return null;
-  const base = settings.baseUrl.replace(/\/+$/, '');
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-  const cleanName = String(name).trim().replace(/'/g, "''");
-  const url = `${base}/Catalog_ФизическиеЛица?$format=json&$filter=${encodeURIComponent(`Description eq '${cleanName}'`)}&$select=Ref_Key&$top=1`;
-  const response = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-  if (!response.ok) return null;
-  const data = await response.json().catch(() => null);
-  return (data && data.value && data.value[0] && data.value[0].Ref_Key) || null;
-}
-
+// createDraftInOnec теперь тонкая обёртка над buildPayload (lib/buildPayload.js)
+// + writeTo1C (lib/writeTo1C.js) — раньше сборка payload и его отправка были
+// одной функцией. Поведение и сигнатура не изменились, вызывающий код
+// (confirmOperation, /batch-create-documents) не нужно трогать.
 async function createDraftInOnec(op, settings, resolvedCategory, resolvedAccount, resolvedOperationKind, resolvedDebtType) {
-  const base = settings.baseUrl.replace(/\/+$/, ''); // убираем лишний / на конце
-  const docType = op.amount >= 0 ? 'Document_ПлатежноеПоручениеВходящее' : 'Document_ПлатежноеПоручениеИсходящее';
-  const endpoint = `${base}/${docType}`;
-  const auth = Buffer.from(`${settings.login}:${settings.password}`).toString('base64');
-
-  const payload = {
-    Date: toIsoDate(op.date),
-    Posted: false, // черновик — не проводится автоматически
-    Организация_Key: settings.orgKey || '',
-    СчетОрганизации_Key: settings.accountKey || '',
-    Контрагент_Key: op.counterpartyKey || '', // если контрагент не найден — не отправляем, см. ниже
-    СуммаДокумента: Math.abs(op.amount),
-    НазначениеПлатежа: op.purpose,
-    Комментарий: op.purpose, // должно совпадать с назначением платежа, как в вашей 1С
-  };
-
-  // Статья ДДС: если вы её НЕ правили руками и в истории 1С уже есть
-  // готовый GUID — используем его напрямую. Иначе (ручная правка, правило,
-  // или текст без готового GUID) ищем статью по названию в справочнике.
-  let categoryKey = null;
-  if (!op.manualCategory && op.historicalCategoryKey) {
-    categoryKey = op.historicalCategoryKey;
-  } else if (resolvedCategory) {
-    categoryKey = await findCategoryKeyByName(resolvedCategory, settings);
-    // Если не нашли даже по имени — не страшно: текст статьи уже есть в
-    // комментарии и в интерфейсе, вы сможете проставить её вручную в 1С.
-  }
-  if (categoryKey) payload.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
-
-  // "Вид операции" — строгий список в 1С. Приоритет:
-  //   1. История (скопировано с уже существующего документа — 100% верно)
-  //   2. Подтверждённое точное значение (проверено напрямую через вашу базу)
-  //   3. Обоснованная попытка по тому же принципу именования — если 1С её
-  //      отклонит, мы автоматически повторим запрос без этого поля (см. ниже).
-  let operationKindLiteral = null;
-  if (op.historicalOperationKind) {
-    operationKindLiteral = op.historicalOperationKind;
-  } else if (resolvedOperationKind) {
-    operationKindLiteral = guessOperationKindLiteral(resolvedOperationKind);
-  } else if (op.amount < 0 && (resolvedCategory === 'Расчёты с поставщиками и подрядчиками' || resolvedCategory === 'Расчеты с поставщиками и подрядчиками')) {
-    // Базовый сценарий "Оплата поставщику" (нет ни истории, ни более
-    // специфичного правила вроде аренды/зарплаты/налогов) — ставим вид
-    // операции по умолчанию. Если точное написание в вашей 1С отличается,
-    // это поле безопасно "отвалится" через OPTIONAL_FIELDS ниже.
-    operationKindLiteral = guessOperationKindLiteral('Оплата поставщику');
-  }
-  if (operationKindLiteral) {
-    payload.ВидОперации = operationKindLiteral;
-  }
-
-  // Договор — привязываем, только если найден однозначно. Если у
-  // контрагента несколько договоров и непонятно, какой из них — лучше
-  // остановиться и попросить вас выбрать вручную, чем угадать неверно.
-  // Если нет ни одного договора, ни "Без договора" — тоже не гадаем и не
-  // создаём автоматически: просто оставляем поле пустым и явно сообщаем
-  // об этом через droppedFields, чтобы бухгалтер создал "Без договора"
-  // кнопкой (/create-no-contract) до или после создания черновика.
-  if (op.contractStatus === 'ambiguous') {
-    throw new Error('У контрагента несколько договоров, и не удалось определить нужный по назначению платежа — выберите договор вручную перед подтверждением.');
-  }
-  const missingNoContract = op.contractStatus === 'need_create_no_contract' && !op.contractKey;
-  if (op.contractKey) {
-    payload.Договор_Key = op.contractKey;
-  }
-
-  // ВАЖНО: сумма, статья ДДС и договор в этом документе хранятся не
-  // только на уровне самого документа, но и в отдельной табличной части
-  // "Расшифровка платежа" (видна как таблица внутри документа в 1С).
-  // Без нее табличная часть остаётся пустой строкой, даже если общая
-  // сумма наверху документа заполнена правильно.
-  //
-  // ВАЖНО №2: если GUID-поле (Договор_Key, СтатьяДвиженияДенежныхСредств_Key)
-  // неизвестно — его нужно просто НЕ включать в объект, а не отправлять
-  // пустую строку. 1С понимает "поля нет" нормально, а вот пустую строку
-  // вместо GUID отвергает ошибкой "Не удалось разобрать строку '' как
-  // значение типа Edm.Guid".
-  const amountAbs = Math.abs(op.amount);
-  const lineItem = {
-    LineNumber: 1,
-    СуммаПлатежа: amountAbs,
-    КурсВзаиморасчетов: 1,
-    СуммаВзаиморасчетов: amountAbs,
-  };
-  if (op.contractKey) lineItem.Договор_Key = op.contractKey;
-  if (categoryKey) lineItem.СтатьяДвиженияДенежныхСредств_Key = categoryKey;
-
-  // "Вид задолженности" — раньше бралось ТОЛЬКО из истории 1С; если у
-  // контрагента ещё нет истории, поле молча оставалось пустым, даже если
-  // resolvedDebtType (из правила/ручной правки/подстановки по умолчанию)
-  // был известен. Приоритет: история 1С (100% верно) > то, что определили
-  // для этой операции.
-  const debtTypeValue = op.historicalDebtType || resolvedDebtType || '';
-  if (debtTypeValue) lineItem.ВидЗадолженности = debtTypeValue;
-
-  // "Счёт учёта (БУ)" в табличной части — ищем GUID счёта по коду
-  // (resolvedAccount, например "1251"). Раньше resolvedAccount вообще не
-  // использовался внутри этой функции — счёт нигде не попадал в документ.
-  const accountKey = await findAccountKeyByCode(resolvedAccount, settings);
-  if (accountKey) lineItem.СчетУчета_Key = accountKey;
-
-  // "Подотчётник" — отдельное поле табличной части именно для операции
-  // "Перечисление денежных средств подотчётнику": получатель там обычно
-  // указывается той же ссылкой, что и Контрагент_Key в шапке документа.
-  // Добавляем это поле, только когда вид операции действительно про
-  // подотчётные средства — на остальных документах такого поля нет.
-  const isAccountablePersonPayment = /подотчет/i.test(
-    String(resolvedOperationKind || '') + ' ' + String(op.historicalOperationKind || '')
+  const { endpoint, payload, missingNoContract } = await buildPayload(
+    op, settings, resolvedCategory, resolvedAccount, resolvedOperationKind, resolvedDebtType
   );
-  if (isAccountablePersonPayment) {
-    // Подотчётник — физлицо, а не контрагент: Ref_Key контрагента сюда
-    // не подходит, даже если это тот же человек. Ищем в справочнике
-    // физических лиц по ФИО.
-    const individualKey = await findIndividualKeyByName(op.counterparty, settings);
-    if (individualKey) lineItem.Подотчетник_Key = individualKey;
-  }
-
-  payload.РасшифровкаПлатежа = [lineItem];
-
-  if (!op.counterpartyKey) {
-    throw new Error('Контрагент не сопоставлен со справочником 1С — сначала выберите контрагента вручную');
-  }
-
-  async function postDocument(body) {
-    return fetch(`${endpoint}?$format=json`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${auth}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-  }
-
-  // Точные названия некоторых полей (Подотчетник_Key, СчетУчета_Key и т.п.)
-  // мы не можем угадать со 100% гарантией без доступа к вашей конкретной базе
-  // 1С — они могут называться иначе в вашей конфигурации. Поэтому вместо
-  // того чтобы один раз попробовать и в случае ошибки просто провалить
-  // создание черновика целиком — если 1С отвечает ошибкой, ссылающейся на
-  // одно из НЕОБЯЗАТЕЛЬНЫХ полей ниже, мы убираем именно это поле (и из
-  // шапки документа, и из строки табличной части) и пробуем снова. Так
-  // черновик создаётся почти всегда, а какие поля не прижились — видно в
-  // истории действий (see /api/operations/:id/confirm), чтобы можно было
-  // подсказать нам точное название поля под вашу конфигурацию.
-  const OPTIONAL_FIELDS = [
-    'ВидОперации',
-    'Договор_Key',
-    'СтатьяДвиженияДенежныхСредств_Key',
-    'ВидЗадолженности',
-    'Подотчетник_Key',
-    'СчетУчета_Key',
-    'РасшифровкаПлатежа',
-  ];
-  function fieldIsPresent(payloadObj, fieldName) {
-    if (fieldName in payloadObj) return true;
-    return Array.isArray(payloadObj.РасшифровкаПлатежа) && payloadObj.РасшифровкаПлатежа.some(row => fieldName in row);
-  }
-  function stripOptionalField(payloadObj, fieldName) {
-    if (fieldName === 'РасшифровкаПлатежа') {
-      const { РасшифровкаПлатежа, ...rest } = payloadObj;
-      return rest;
-    }
-    const clone = { ...payloadObj };
-    delete clone[fieldName];
-    if (Array.isArray(clone.РасшифровкаПлатежа)) {
-      clone.РасшифровкаПлатежа = clone.РасшифровкаПлатежа.map(row => {
-        if (!(fieldName in row)) return row;
-        const rowCopy = { ...row };
-        delete rowCopy[fieldName];
-        return rowCopy;
-      });
-    }
-    return clone;
-  }
-
-  let currentPayload = payload;
-  let response = await postDocument(currentPayload);
-  const droppedFields = [];
-  if (missingNoContract) droppedFields.push('Договор_Key (нет договора и нет «Без договора» — создайте кнопкой «Без договора» или в 1С)');
-  let safetyCounter = 0;
-  while (!response.ok && safetyCounter < OPTIONAL_FIELDS.length) {
-    safetyCounter++;
-    const text = await response.text().catch(() => '');
-    const badField = OPTIONAL_FIELDS.find(f => fieldIsPresent(currentPayload, f) && text.includes(f));
-    if (!badField) {
-      throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
-    }
-    droppedFields.push(badField);
-    currentPayload = stripOptionalField(currentPayload, badField);
-    response = await postDocument(currentPayload);
-  }
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`1С ответила ${response.status}: ${text.slice(0, 300)}`);
-  }
-
-  const data = await response.json().catch(() => ({}));
-  return { docNumber: data.Number || null, droppedFields };
+  return writeTo1C(endpoint, payload, settings, { missingNoContract });
 }
 
 // ---------- начальные данные при первом запуске / восстановление после передеплоя ----------
